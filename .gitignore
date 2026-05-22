@@ -1,0 +1,34 @@
+# ========================
+# Project Specific
+# ========================
+# Ignore the downloaded MNIST dataset
+data/
+
+# Ignore the generated training logs
+training_logs.txt
+*.log
+
+# ========================
+# Python
+# ========================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+.venv/
+.env
+
+# ========================
+# OS & IDEs
+# ========================
+# Mac / Windows system files
+.DS_Store
+Thumbs.db
+
+# VS Code / PyCharm settings
+.vscode/
+.idea/
