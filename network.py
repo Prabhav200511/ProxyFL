@@ -1,3 +1,4 @@
+# network.py
 import socket
 import pickle
 import struct

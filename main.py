@@ -1,6 +1,6 @@
-import time
+# main.py
 from config import *
-from server import Server
+from server import Server, training_done_event
 from device import Device
 from rsu import RSU
 from shared_logger import logger
@@ -24,11 +24,10 @@ def main():
     for d in devices:
         d.start()
 
-    active = True
-    while active:
-        time.sleep(5)
-        if len(logger.global_table.rows) >= TOTAL_ROUNDS:
-            active = False
+    print("[MAIN] Training loop initialized. Processing network streams...")
+    
+    # Safely block main thread until server signals completion
+    training_done_event.wait()
 
     print("\nTraining Complete! Saving logs to 'training_logs.txt'...")
     logger.save_logs("training_logs.txt")

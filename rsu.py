@@ -1,3 +1,4 @@
+# rsu.py
 from network import Receiver, send_msg
 from models import average_weights
 
@@ -13,10 +14,8 @@ class RSU:
     def on_receive(self, msg):
         if msg["type"] == "LOCAL_UPDATE":
             r = msg["round"]
-            
             if r not in self.round_buffers:
                 self.round_buffers[r] = []
-                
             self.round_buffers[r].append(msg)
 
             if len(self.round_buffers[r]) == len(self.cluster_ports):
@@ -29,17 +28,11 @@ class RSU:
     def aggregate(self, r):
         data = self.round_buffers[r]
         avg_weights = average_weights([d["weights"] for d in data])
-
-        print(f"[{self.name}] Forwarding aggregated cluster model to Server")
-        msg = {
-            "type": "CLUSTER_UPDATE",
-            "rsu_port": self.port,
-            "round": r,
-            "avg_weights": avg_weights
-        }
-
+        
+        print(f"[{self.name}] Forwarding aggregated cluster proxy to Server (Round {r})")
+        msg = {"type": "CLUSTER_UPDATE", "rsu_port": self.port, "round": r, "avg_weights": avg_weights}
         send_msg(("127.0.0.1", self.server_port), msg)
-        del self.round_buffers[r]
+        del self.round_buffers[r] 
 
     def start(self):
         self.receiver.start()
