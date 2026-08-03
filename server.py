@@ -3,7 +3,7 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, f1_score, recall_score
 from torch.utils.data import DataLoader, Dataset
-
+import numpy as np
 from shared_logger import logger
 from network import Receiver, send_msg
 from models import jsd_weighted_average, VanetIDS
@@ -16,8 +16,16 @@ training_done_event = threading.Event()
 # Reusing the Dataset class for the Server's testing phase
 class VANETDataset(Dataset):
     def __init__(self, dataframe):
-        features = dataframe[['velocity_x', 'velocity_y', 'constant_offset_check', 'total_displacement']].values
+        # Use only the original 4 features for the stable Deep MLP
+        features = dataframe[[
+            'velocity_x',
+            'velocity_y',
+            'constant_offset_check',
+            'total_displacement'
+        ]].values
+        
         targets = dataframe['attacktype'].values
+        
         self.x = torch.tensor(features, dtype=torch.float32)
         self.y = torch.tensor(targets, dtype=torch.long)
         
@@ -35,34 +43,29 @@ class Server:
         self.rsu_ports = []
         self.receiver = Receiver(self.port, self.on_receive)
         
-        # Load the new VANET Neural Network
         self.model = VanetIDS().to(device)
+        # --- SERVER TESTING DATA PREPARATION ---
+        print("[SERVER] Loading and engineering attack test datasets...")
+        test_files = ['attack1_test.csv', 'attack2_test.csv', 'attack3_test.csv', 'attack4_test.csv', 'attack5_test.csv']
         
-        # --- CYBERSECURITY TEST DATA PREPARATION ---
-        print("[SERVER] Loading and scaling attack test datasets...")
-        test_files = [
-            'attack1_test.csv', 'attack2_test.csv', 
-            'attack3_test.csv', 'attack4_test.csv', 'attack5_test.csv'
-        ]
-        
-        # Combine all test files into one massive test dataframe
         dfs = []
         for file in test_files:
             try:
                 dfs.append(pd.read_csv(file))
             except FileNotFoundError:
-                print(f"[WARNING] Could not find {file}. Ensure it is in the directory.")
+                print(f"[WARNING] Could not find {file}")
                 
         if dfs:
             test_df = pd.concat(dfs, ignore_index=True)
-            
-            # CRITICAL FIX: Fit the scaler on the training data, then transform the test data
             train_df = pd.read_csv('Main_data_shuffled.csv')
-            feature_cols = ['velocity_x', 'velocity_y', 'constant_offset_check', 'total_displacement']
-            scaler = StandardScaler()
-            scaler.fit(train_df[feature_cols]) # FIT on training data only
             
-            test_df[feature_cols] = scaler.transform(test_df[feature_cols]) # TRANSFORM test data
+            # Scale only the original 4 features
+            feature_cols = [
+                'velocity_x', 'velocity_y', 'constant_offset_check', 'total_displacement'
+            ]
+            scaler = StandardScaler()
+            scaler.fit(train_df[feature_cols])
+            test_df[feature_cols] = scaler.transform(test_df[feature_cols])
             
             self.test_dataset = VANETDataset(test_df)
             self.test_loader = DataLoader(self.test_dataset, batch_size=1000, shuffle=False)

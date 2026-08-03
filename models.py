@@ -22,10 +22,11 @@ class SimpleMNIST(nn.Module):
         x = self.relu(self.fc1(x))
         return self.fc2(x)
 
+
 class VanetIDS(nn.Module):
     def __init__(self):
         super().__init__()
-        # Made the network significantly wider and slightly deeper
+        # 4 original features -> 128 -> 64 -> 32 -> 6 outputs
         self.fc1 = nn.Linear(4, 128)
         self.ln1 = nn.LayerNorm(128)
         self.relu = nn.ReLU()
