@@ -20,7 +20,7 @@ from config import (
     TOTAL_ROUNDS, TIMEOUT, BATCH_SIZE, LOCAL_EPOCHS,
     DP_CLIP_NORM, DP_NOISE_MULTIPLIER, DP_DELTA, DP_MAX_EPSILON,
     DML_ALPHA, DML_BETA, DML_TEMPERATURE,
-    V2RSU_RANGE, DEVICE
+    V2RSU_RANGE, DEVICE, TRAINING_SEMAPHORE
 )
 from data_utils import VANETDataset, get_vanet_scaler
 from shared_logger import logger
@@ -62,6 +62,7 @@ class Device:
         self.peer_directory = peer_directory or {}
         self.dataset_type = dataset_type
         self.total_rounds = total_rounds
+        self.current_round = 0
         self.budget_exhausted = False
 
         # ---- Model Selection ----
@@ -120,6 +121,10 @@ class Device:
             end_idx = (len(full_mnist) if device_id == total_vehicles - 1
                        else (device_id + 1) * subset_size)
             subset_indices = list(range(start_idx, end_idx))
+            
+            # Cap local sample size to realistic vehicle edge limit (max 1000 samples)
+            if len(subset_indices) > 1000:
+                subset_indices = subset_indices[:1000]
 
             # 80/20 train/test split for local evaluation
             n_test = max(1, int(len(subset_indices) * 0.2))
@@ -187,10 +192,12 @@ class Device:
     # ------------------------------------------------------------------
     def on_receive(self, msg):
         if msg["type"] == "GLOBAL_UPDATE":
-            # Update proxy model with server-aggregated global proxy
-            with self.proxy_lock:
-                self.proxy_model.load_state_dict(msg["global_weights"])
-            self.round_event.set()
+            msg_round = msg.get("round", None)
+            # Accept global update if matching the current round or if unnumbered
+            if msg_round is None or msg_round == self.current_round:
+                with self.proxy_lock:
+                    self.proxy_model.load_state_dict(msg["global_weights"])
+                self.round_event.set()
 
     # ------------------------------------------------------------------
     # DML Training with DP-SGD on proxy
@@ -200,69 +207,71 @@ class Device:
 
         Private model: L = (1 − α)·CE + α·KL  (standard optimizer, no DP)
         Proxy model:   L = (1 − β)·CE + β·KL  (vectorized per-sample DP-SGD)
+        Throttled via TRAINING_SEMAPHORE to prevent GPU/OpenMP collision.
         """
-        self.private_model.train()
-        if not self.budget_exhausted:
-            self.proxy_model.train()
-
-        priv_loss_sum, priv_correct, proxy_loss_sum, total = 0, 0, 0, 0
-
-        for data, target in self.dataloader:
-            data, target = data.to(DEVICE), target.to(DEVICE)
-            batch_size = data.size(0)
-
-            # --- Soft targets from each model (detached) ---
-            with torch.no_grad():
-                with self.proxy_lock:
-                    proxy_soft = F.softmax(
-                        self.proxy_model(data) / DML_TEMPERATURE, dim=1)
-                private_soft = F.softmax(
-                    self.private_model(data) / DML_TEMPERATURE, dim=1)
-
-            # --- Update private model (no DP, Eq. 4) ---
-            private_out = self.private_model(data)
-            private_ce = self.criterion(private_out, target)
-            private_kl = dml_loss(private_out, proxy_soft, DML_TEMPERATURE)
-            private_total = ((1 - DML_ALPHA) * private_ce
-                             + DML_ALPHA * private_kl)
-
-            self.private_optimizer.zero_grad()
-            private_total.backward()
-            self.private_optimizer.step()
-
-            # --- Update proxy model (Eq. 5, with vectorized DP-SGD if enabled) ---
+        with TRAINING_SEMAPHORE:
+            self.private_model.train()
             if not self.budget_exhausted:
-                with self.proxy_lock:
-                    if self.dp_noise_multiplier > 0:
-                        self._dp_sgd_step(data, target, private_soft)
-                        self.privacy_accountant.step(1)
-                    else:
-                        # Non-DP batch baseline
-                        proxy_out = self.proxy_model(data)
-                        proxy_ce = self.criterion(proxy_out, target)
-                        proxy_kl = dml_loss(
-                            proxy_out, private_soft, DML_TEMPERATURE)
-                        proxy_total = ((1 - DML_BETA) * proxy_ce
-                                       + DML_BETA * proxy_kl)
-                        self.proxy_optimizer.zero_grad()
-                        proxy_total.backward()
-                        self.proxy_optimizer.step()
+                self.proxy_model.train()
 
-            # --- Metrics ---
-            priv_loss_sum += private_ce.item()
-            pred = private_out.argmax(dim=1, keepdim=True)
-            priv_correct += pred.eq(target.view_as(pred)).sum().item()
-            with torch.no_grad():
-                with self.proxy_lock:
-                    proxy_ce_log = self.criterion(
-                        self.proxy_model(data), target)
-            proxy_loss_sum += proxy_ce_log.item()
-            total += batch_size
+            priv_loss_sum, priv_correct, proxy_loss_sum, total = 0, 0, 0, 0
 
-        n_batches = len(self.dataloader)
-        return (priv_loss_sum / max(n_batches, 1),
-                priv_correct / max(total, 1),
-                proxy_loss_sum / max(n_batches, 1))
+            for data, target in self.dataloader:
+                data, target = data.to(DEVICE), target.to(DEVICE)
+                batch_size = data.size(0)
+
+                # --- Soft targets from each model (detached) ---
+                with torch.no_grad():
+                    with self.proxy_lock:
+                        proxy_soft = F.softmax(
+                            self.proxy_model(data) / DML_TEMPERATURE, dim=1)
+                    private_soft = F.softmax(
+                        self.private_model(data) / DML_TEMPERATURE, dim=1)
+
+                # --- Update private model (no DP, Eq. 4) ---
+                private_out = self.private_model(data)
+                private_ce = self.criterion(private_out, target)
+                private_kl = dml_loss(private_out, proxy_soft, DML_TEMPERATURE)
+                private_total = ((1 - DML_ALPHA) * private_ce
+                                 + DML_ALPHA * private_kl)
+
+                self.private_optimizer.zero_grad()
+                private_total.backward()
+                self.private_optimizer.step()
+
+                # --- Update proxy model (Eq. 5, with vectorized DP-SGD if enabled) ---
+                if not self.budget_exhausted:
+                    with self.proxy_lock:
+                        if self.dp_noise_multiplier > 0:
+                            self._dp_sgd_step(data, target, private_soft)
+                            self.privacy_accountant.step(1)
+                        else:
+                            # Non-DP batch baseline
+                            proxy_out = self.proxy_model(data)
+                            proxy_ce = self.criterion(proxy_out, target)
+                            proxy_kl = dml_loss(
+                                proxy_out, private_soft, DML_TEMPERATURE)
+                            proxy_total = ((1 - DML_BETA) * proxy_ce
+                                           + DML_BETA * proxy_kl)
+                            self.proxy_optimizer.zero_grad()
+                            proxy_total.backward()
+                            self.proxy_optimizer.step()
+
+                # --- Metrics ---
+                priv_loss_sum += private_ce.item()
+                pred = private_out.argmax(dim=1, keepdim=True)
+                priv_correct += pred.eq(target.view_as(pred)).sum().item()
+                with torch.no_grad():
+                    with self.proxy_lock:
+                        proxy_ce_log = self.criterion(
+                            self.proxy_model(data), target)
+                proxy_loss_sum += proxy_ce_log.item()
+                total += batch_size
+
+            n_batches = len(self.dataloader)
+            return (priv_loss_sum / max(n_batches, 1),
+                    priv_correct / max(total, 1),
+                    proxy_loss_sum / max(n_batches, 1))
 
     def _dp_sgd_step(self, data, target, private_soft):
         """Vectorized per-sample DP-SGD step for the proxy model (Eq. 6–7).
@@ -334,6 +343,9 @@ class Device:
     def send(self):
         for r in range(1, self.total_rounds + 1):
           try:
+            self.current_round = r
+            self.round_event.clear()
+
             if self.name.endswith("D1"):
                 print(f"\n[{'=' * 15} ROUND {r} {'=' * 15}]")
 
@@ -385,7 +397,7 @@ class Device:
             if not self.budget_exhausted:
                 self.proxy_scheduler.step()
 
-            # 5. Check V2RSU range -> send proxy to RSU
+            # 5. Check V2RSU range -> send proxy to RSU & wait for global round sync
             dist = self.topology.get_distance_to_rsu(
                 self.name, self.rsu_name)
             can_reach = self.topology.can_reach_rsu(
@@ -405,15 +417,21 @@ class Device:
                 }
                 send_msg(("127.0.0.1", self.rsu_port), msg)
 
-                # Wait for global update
+                # Wait for global update for this round
                 received = self.round_event.wait(timeout=TIMEOUT)
-                self.round_event.clear()
                 if not received:
-                    print(f"[{self.name}] [!] Timed out waiting for global update")
+                    print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
             elif self.budget_exhausted and can_reach:
-                print(f"[{self.name}] In range but privacy budget exhausted. Skipping proxy upload.")
+                print(f"[{self.name}] In range but privacy budget exhausted. Waiting for global update...")
+                received = self.round_event.wait(timeout=TIMEOUT)
+                if not received:
+                    print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
             else:
-                print(f"[{self.name}] [X] OUT OF RANGE ({dist:.0f}m > {V2RSU_RANGE}m). Skipping RSU this round.")
+                print(f"[{self.name}] [X] OUT OF RANGE ({dist:.0f}m > {V2RSU_RANGE}m). Synchronizing on round barrier...")
+                # Wait for round broadcast so out-of-range vehicles do not race ahead
+                received = self.round_event.wait(timeout=TIMEOUT)
+                if not received:
+                    print(f"[{self.name}] [!] Timed out waiting for round {r} synchronization")
 
             # 6. Move vehicle
             self.topology.move_vehicle(self.name)

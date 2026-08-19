@@ -1,5 +1,7 @@
 # logger.py — Metrics logging and automatic plot generation for ProxyFL
 import os
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from prettytable import PrettyTable
 

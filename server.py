@@ -12,7 +12,7 @@ import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, recall_score
 from torch.utils.data import DataLoader
 
-from config import TOTAL_ROUNDS, DEVICE
+from config import TOTAL_ROUNDS, DEVICE, RSU_BASE_PORT
 from data_utils import VANETDataset, get_vanet_scaler
 from shared_logger import logger
 from network import Receiver, send_msg
@@ -22,7 +22,7 @@ from models import jsd_weighted_average, ProxyModel, MNISTProxyModel
 
 training_done_event = threading.Event()
 
-SERVER_ROUND_TIMEOUT = 12  # seconds — aggregate whatever RSUs reported
+SERVER_ROUND_TIMEOUT = 30  # seconds — aggregate whatever RSUs reported
 
 
 class Server:
@@ -40,7 +40,7 @@ class Server:
         self.total_rounds = total_rounds
         self.round_buffers = {}
         self.completed_rounds = set()
-        self.rsu_ports = []
+        self.rsu_ports = [RSU_BASE_PORT + i for i in range(expected_rsus)]
         self._round_timers = {}
         self._lock = threading.Lock()  # protects round_buffers, completed_rounds, rsu_ports, _round_timers
         self.receiver = Receiver(self.port, self.on_receive)
@@ -182,9 +182,25 @@ class Server:
                 n = len(self.round_buffers[r])
                 print(f"[SERVER] [!] Timeout! Aggregating {n}/"
                       f"{self.expected_rsus} RSUs for round {r}")
+            else:
+                print(f"[SERVER] [!] Timeout! 0 RSUs reported for round {r}. Broadcasting current global proxy.")
+                self.completed_rounds.add(r)
+                self._cancel_timer_locked(r)
+                self.round_buffers.pop(r, None)
+                rsu_ports_snapshot = list(self.rsu_ports)
 
         if has_data:
             self.aggregate(r)
+        else:
+            msg = {
+                "type": "GLOBAL_UPDATE",
+                "round": r,
+                "global_weights": self.model.state_dict(),
+            }
+            for p in rsu_ports_snapshot:
+                send_msg(("127.0.0.1", p), msg)
+            if r >= self.total_rounds:
+                training_done_event.set()
 
     def _cancel_timer_locked(self, r):
         """Cancel a round timer. Must be called with self._lock held."""

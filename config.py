@@ -4,7 +4,7 @@
 # FEDERATED LEARNING
 # ==========================================
 TOTAL_ROUNDS = 5
-TIMEOUT = 25
+TIMEOUT = 45
 BATCH_SIZE = 32
 LOCAL_EPOCHS = 3
 
@@ -39,10 +39,23 @@ RSU_BASE_PORT = 5000
 DEVICE_BASE_PORT = 6000
 
 # ==========================================
-# HARDWARE / DEVICE SELECTION
+# HARDWARE & CONCURRENCY SAFETY (SIGABRT Prevention)
 # ==========================================
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import torch
 import warnings
+import threading
+
+# Prevent OpenMP thread explosion across multi-vehicle simulation threads
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
 
 _device_str = "cpu"
 if torch.cuda.is_available():
@@ -51,3 +64,7 @@ elif torch.backends.mps.is_available():
     _device_str = "mps"
 
 DEVICE = torch.device(_device_str)
+
+# Concurrency limiter to prevent GPU memory/kernel collisions or thread exhaustion
+MAX_CONCURRENT_TRAINING = 4 if _device_str == "cuda" else 8
+TRAINING_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_TRAINING)

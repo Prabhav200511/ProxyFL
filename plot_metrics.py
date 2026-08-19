@@ -1,5 +1,7 @@
 # plot_metrics.py — Generates Accuracy vs Rounds and Loss vs Rounds from logs
 import os
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 

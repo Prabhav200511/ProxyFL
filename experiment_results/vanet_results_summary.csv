@@ -1,0 +1,3 @@
+dataset,clusters,vehicles_per_cluster,total_nodes,rounds,duration_sec,final_global_proxy_acc,avg_final_private_acc,avg_final_train_loss,status
+vanet,2,2,4,4,437.26,76.6,82.105,0.7287250000000001,SUCCESS
+vanet,2,5,10,4,435.62,70.4,81.03,0.7595666666666667,SUCCESS

@@ -3,6 +3,11 @@
 # Unified command-line interface for running ProxyFL on MNIST, VANET, or Both.
 # Automatically logs metrics and produces Accuracy vs. Rounds and Loss vs. Rounds plots.
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import argparse
 import subprocess
 import sys

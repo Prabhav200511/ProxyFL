@@ -11,7 +11,7 @@ from models import average_weights
 from network import Receiver, send_msg
 
 
-RSU_ROUND_TIMEOUT = 12  # seconds — generous window for local training before aggregating
+RSU_ROUND_TIMEOUT = 25  # seconds — generous window for local training before aggregating
 
 
 class RSU:
