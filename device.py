@@ -11,6 +11,7 @@
 # RDP accountant and logged per round.
 
 import threading
+import time
 import torch
 import torch.nn.functional as F
 import pandas as pd
@@ -20,7 +21,7 @@ from config import (
     TOTAL_ROUNDS, TIMEOUT, BATCH_SIZE, LOCAL_EPOCHS,
     DP_CLIP_NORM, DP_NOISE_MULTIPLIER, DP_DELTA, DP_MAX_EPSILON,
     DML_ALPHA, DML_BETA, DML_TEMPERATURE,
-    V2RSU_RANGE, DEVICE, TRAINING_SEMAPHORE
+    V2RSU_RANGE, DEVICE, TRAINING_SEMAPHORE, SECURITY_ENABLED
 )
 from data_utils import VANETDataset, get_vanet_scaler
 from shared_logger import logger
@@ -30,6 +31,12 @@ from models import (VanetIDS, ProxyModel,
 from network import Receiver, send_msg
 from privacy import RDPAccountant
 from torchvision import datasets, transforms
+from crypto_protocol import (
+    Authority, CertificatelessSigner, build_envelope, encrypt_payload,
+    message_aad,
+)
+from metrics import Timer, metrics_tracker
+from model_codec import deserialize_weights, serialize_weights
 
 
 class Device:
@@ -51,9 +58,10 @@ class Device:
     """
 
     def __init__(self, name, port, rsu_port, rsu_name,
-                 device_id, total_vehicles, topology, peer_directory=None,
-                 dataset_type="mnist", private_model_class=None,
-                 total_rounds=TOTAL_ROUNDS):
+                  device_id, total_vehicles, topology, peer_directory=None,
+                  dataset_type="mnist", private_model_class=None,
+                  total_rounds=TOTAL_ROUNDS, security_authority: Authority | None = None,
+                  security_identity: CertificatelessSigner | None = None):
         self.name = name
         self.port = port
         self.rsu_port = rsu_port
@@ -64,6 +72,12 @@ class Device:
         self.total_rounds = total_rounds
         self.current_round = 0
         self.budget_exhausted = False
+        self.security_authority = security_authority
+        self.security_identity = security_identity
+        self.security_enabled = bool(
+            SECURITY_ENABLED and self.security_authority is not None
+            and self.security_identity is not None
+        )
 
         # ---- Model Selection ----
         torch.manual_seed(42)  # Deterministic proxy init across all devices
@@ -185,7 +199,7 @@ class Device:
         # ---- Synchronization ----
         self.round_event = threading.Event()
         self.proxy_lock = threading.Lock()
-        self.receiver = Receiver(self.port, self.on_receive)
+        self.receiver = Receiver(self.port, self.on_receive, metric_node=self.name)
 
     # ------------------------------------------------------------------
     # Message handling (Device -> RSU -> Server hierarchy)
@@ -196,7 +210,7 @@ class Device:
             # Accept global update if matching the current round or if unnumbered
             if msg_round is None or msg_round == self.current_round:
                 with self.proxy_lock:
-                    self.proxy_model.load_state_dict(msg["global_weights"])
+                    self.proxy_model.load_state_dict(deserialize_weights(msg["global_payload"]))
                 self.round_event.set()
 
     # ------------------------------------------------------------------
@@ -337,11 +351,35 @@ class Device:
                     total += target.size(0)
         return correct / total if total > 0 else 0.0
 
+    def _send_no_update(self, round_num: int) -> None:
+        """Authenticated control signal so an absent vehicle cannot deadlock a round."""
+        payload = b"NO_UPDATE"
+        if self.security_enabled:
+            rsu_public = self.security_authority.public_info(self.rsu_name)
+            aad = message_aad("NO_UPDATE", self.name, self.rsu_name, round_num)
+            with Timer(self.name, round_num, "signature_generation"):
+                signature = self.security_identity.sign(payload)
+            with Timer(self.name, round_num, "encryption"):
+                ciphertext, nonce, tag = encrypt_payload(
+                    self.security_identity.shared_secret_for(rsu_public), payload, aad)
+            msg = build_envelope(
+                "NO_UPDATE", self.security_identity, self.rsu_name, round_num,
+                signature, ciphertext, nonce, tag,
+            )
+        else:
+            msg = {
+                "type": "NO_UPDATE", "sender": self.name,
+                "recipient": self.rsu_name, "round": round_num, "payload": payload,
+            }
+        send_msg(("127.0.0.1", self.rsu_port), msg,
+                 metric_node=self.name, round_num=round_num)
+
     # ------------------------------------------------------------------
     # Main training loop
     # ------------------------------------------------------------------
     def send(self):
         for r in range(1, self.total_rounds + 1):
+          round_started = time.perf_counter()
           try:
             self.current_round = r
             self.round_event.clear()
@@ -355,10 +393,11 @@ class Device:
                       else "(private only -- budget exhausted)")
             print(f"[{self.name}] Training {status}...")
             total_priv_loss, total_priv_acc = 0, 0
-            for _ in range(LOCAL_EPOCHS):
-                priv_loss, priv_acc, proxy_loss = self.train_epoch()
-                total_priv_loss += priv_loss
-                total_priv_acc += priv_acc
+            with Timer(self.name, r, "training"):
+                for _ in range(LOCAL_EPOCHS):
+                    priv_loss, priv_acc, proxy_loss = self.train_epoch()
+                    total_priv_loss += priv_loss
+                    total_priv_acc += priv_acc
 
             avg_loss = total_priv_loss / max(LOCAL_EPOCHS, 1)
             avg_acc = total_priv_acc / max(LOCAL_EPOCHS, 1)
@@ -407,15 +446,33 @@ class Device:
                 print(f"[{self.name}] In range of RSU ({dist:.0f}m). "
                       f"Sending proxy to {self.rsu_name}...")
                 with self.proxy_lock:
-                    proxy_weights = self.proxy_model.state_dict()
+                    proxy_payload = serialize_weights(self.proxy_model.state_dict())
 
-                msg = {
-                    "type": "LOCAL_UPDATE",
-                    "sender": self.name,
-                    "round": r,
-                    "weights": proxy_weights,
-                }
-                send_msg(("127.0.0.1", self.rsu_port), msg)
+                if self.security_enabled:
+                    rsu_public = self.security_authority.public_info(self.rsu_name)
+                    aad = message_aad("LOCAL_UPDATE", self.name, self.rsu_name, r)
+                    with Timer(self.name, r, "signature_generation"):
+                        signature = self.security_identity.sign(proxy_payload)
+                    with Timer(self.name, r, "encryption"):
+                        ciphertext, nonce, tag = encrypt_payload(
+                            self.security_identity.shared_secret_for(rsu_public),
+                            proxy_payload,
+                            aad,
+                        )
+                    msg = build_envelope(
+                        "LOCAL_UPDATE", self.security_identity, self.rsu_name, r,
+                        signature, ciphertext, nonce, tag,
+                    )
+                else:
+                    # A JSON envelope is still used in baseline mode so the
+                    # transport never deserializes untrusted pickle data.
+                    msg = {
+                        "type": "LOCAL_UPDATE", "sender": self.name,
+                        "recipient": self.rsu_name, "round": r,
+                        "payload": proxy_payload,
+                    }
+                send_msg(("127.0.0.1", self.rsu_port), msg,
+                         metric_node=self.name, round_num=r)
 
                 # Wait for global update for this round
                 received = self.round_event.wait(timeout=TIMEOUT)
@@ -423,11 +480,13 @@ class Device:
                     print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
             elif self.budget_exhausted and can_reach:
                 print(f"[{self.name}] In range but privacy budget exhausted. Waiting for global update...")
+                self._send_no_update(r)
                 received = self.round_event.wait(timeout=TIMEOUT)
                 if not received:
                     print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
             else:
                 print(f"[{self.name}] [X] OUT OF RANGE ({dist:.0f}m > {V2RSU_RANGE}m). Synchronizing on round barrier...")
+                self._send_no_update(r)
                 # Wait for round broadcast so out-of-range vehicles do not race ahead
                 received = self.round_event.wait(timeout=TIMEOUT)
                 if not received:
@@ -443,6 +502,9 @@ class Device:
             print(f"[{self.name}] [ERROR] Round {r} failed: {e}")
             import traceback
             traceback.print_exc()
+          finally:
+            metrics_tracker.record_duration(
+                self.name, r, "device_round_execution", time.perf_counter() - round_started)
 
         print(f"[{self.name}] Training Finished")
 

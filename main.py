@@ -14,13 +14,19 @@ import sys
 import threading
 import time
 
-from config import SERVER_PORT, RSU_BASE_PORT, DEVICE_BASE_PORT, RSU_SPACING, TOTAL_ROUNDS
+from config import (
+    SERVER_PORT, RSU_BASE_PORT, DEVICE_BASE_PORT, RSU_SPACING, TOTAL_ROUNDS,
+    SECURITY_ENABLED,
+)
+from crypto_protocol import Authority
 from server import Server, training_done_event
 from device import Device
 from rsu import RSU
 from vanet_sim import VanetTopology, place_rsu, spawn_vehicle
 from shared_logger import logger
 from models import VANET_PRIVATE_ARCHITECTURES, MNIST_PRIVATE_ARCHITECTURES
+from metrics import Timer, metrics_tracker
+from plot_metrics import plot_security_metrics
 
 
 def run_single_simulation(dataset, num_clusters=2, vehicles_per_cluster=2,
@@ -38,6 +44,8 @@ def run_single_simulation(dataset, num_clusters=2, vehicles_per_cluster=2,
     # Reset logging & synchronization
     logger.reset()
     training_done_event.clear()
+    metrics_tracker.reset()
+    metrics_tracker.start_simulation()
 
     # 1. Spatial Topology
     topology = VanetTopology()
@@ -60,11 +68,28 @@ def run_single_simulation(dataset, num_clusters=2, vehicles_per_cluster=2,
 
     peer_directory = {meta[0]: meta[1] for meta in vehicle_meta}
 
-    # 2. Server
-    server = Server(SERVER_PORT, expected_rsus=num_clusters,
-                    dataset_type=dataset, total_rounds=total_rounds)
+    # 2. Out-of-band TA/KGC registration.  All runtime links use only this
+    # pre-provisioned public directory and their own private credentials.
+    security_authority = Authority() if SECURITY_ENABLED else None
+    security_identities = {}
+    if security_authority is not None:
+        registration_names = (["Server"] + [f"Cluster_{i + 1}" for i in range(num_clusters)]
+                              + [meta[0] for meta in vehicle_meta])
+        for node_name in registration_names:
+            with Timer(node_name, 0, "key_generation"):
+                security_identities[node_name] = security_authority.register(node_name)
+        print(f" Security: certificateless authentication enabled ({len(registration_names)} identities)")
+    else:
+        print(" Security: disabled (baseline transport metrics)")
 
-    # 3. RSUs
+    # 3. Server
+    server = Server(SERVER_PORT, expected_rsus=num_clusters,
+                    dataset_type=dataset, total_rounds=total_rounds,
+                    rsu_names=[f"Cluster_{i + 1}" for i in range(num_clusters)],
+                    security_authority=security_authority,
+                    security_identity=security_identities.get("Server"))
+
+    # 4. RSUs
     rsus = []
     for i in range(num_clusters):
         rsu_name = f"Cluster_{i + 1}"
@@ -72,10 +97,12 @@ def run_single_simulation(dataset, num_clusters=2, vehicles_per_cluster=2,
         cluster_ports = [meta[1] for meta in vehicle_meta if meta[3] == rsu_name]
         cluster_names = [meta[0] for meta in vehicle_meta if meta[3] == rsu_name]
         rsu = RSU(rsu_name, rsu_port, cluster_ports, SERVER_PORT,
-                  topology=topology, vehicle_names=cluster_names)
+                  topology=topology, vehicle_names=cluster_names,
+                  security_authority=security_authority,
+                  security_identity=security_identities.get(rsu_name))
         rsus.append(rsu)
 
-    # 4. Devices (with heterogeneous private models if enabled)
+    # 5. Devices (with heterogeneous private models if enabled)
     arch_map = (MNIST_PRIVATE_ARCHITECTURES if dataset == "mnist"
                 else VANET_PRIVATE_ARCHITECTURES)
     arch_classes = list(arch_map.values())
@@ -95,11 +122,13 @@ def run_single_simulation(dataset, num_clusters=2, vehicles_per_cluster=2,
             peer_directory=peer_directory,
             dataset_type=dataset,
             private_model_class=priv_cls,
-            total_rounds=total_rounds
+            total_rounds=total_rounds,
+            security_authority=security_authority,
+            security_identity=security_identities.get(name),
         )
         devices.append(device)
 
-    # 5. Launch threads
+    # 6. Launch threads
     threads = []
     t_server = threading.Thread(target=server.start, daemon=True)
     t_server.start()
@@ -117,7 +146,7 @@ def run_single_simulation(dataset, num_clusters=2, vehicles_per_cluster=2,
 
     print(f"\n[MAIN] All {total_vehicles} vehicles active. Training underway...\n")
 
-    # 6. Await completion
+    # 7. Await completion
     training_done_event.wait()
     time.sleep(1.0)
 
@@ -128,13 +157,23 @@ def run_single_simulation(dataset, num_clusters=2, vehicles_per_cluster=2,
     for device in devices:
         device.shutdown()
 
+    metrics_tracker.finish_simulation()
+
     log_filename = f"{dataset}_training_logs.txt"
     logger.save_logs(log_filename)
     logger.save_logs("training_logs.txt")
     print(f"\n[OK] Logs saved to '{log_filename}' and 'training_logs.txt'")
 
+    metrics_csv = f"{dataset}_per_round_metrics.csv"
+    summary_csv = f"{dataset}_simulation_metrics.csv"
+    metrics_tracker.export_csv(metrics_csv, logger.round_metrics())
+    metrics_tracker.export_simulation_summary(summary_csv)
+    print(f"[OK] Unified metrics: '{metrics_csv}', '{summary_csv}'")
+
     # 7. Generate Plots
     logger.generate_plots(prefix=dataset)
+    for plot_path in plot_security_metrics(metrics_csv, prefix=dataset):
+        print(f"[PLOT] Saved: '{plot_path}'")
 
     print("\n" + "=" * 65)
     print(f" Training Complete for [{dataset.upper()}]!")

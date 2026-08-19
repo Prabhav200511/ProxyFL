@@ -3,6 +3,84 @@ import os
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import pandas as pd
+
+
+def plot_security_metrics(metrics_csv, prefix=""):
+    """Plot per-round security/communication overhead from the unified CSV."""
+    if not os.path.exists(metrics_csv):
+        print(f"[!] Metrics CSV not found: '{metrics_csv}'")
+        return []
+    frame = pd.read_csv(metrics_csv)
+    if frame.empty:
+        return []
+    numeric = [
+        "key_generation_ms", "signature_generation_ms", "signature_verification_ms", "batch_verification_ms",
+        "encryption_ms", "decryption_ms", "communication_latency_ms",
+        "energy_security_j", "energy_communication_j", "energy_total_j",
+        "throughput_updates_per_sec",
+    ]
+    for column in numeric:
+        if column not in frame:
+            frame[column] = 0.0
+    rounds = frame.groupby("round", as_index=False)[numeric].mean(numeric_only=True)
+    prefix_str = f"{prefix}_" if prefix else ""
+    paths = []
+
+    plt.figure(figsize=(10, 6))
+    for column, label in [
+        ("key_generation_ms", "Key generation (bootstrap)"),
+        ("signature_generation_ms", "Signature generation"),
+        ("signature_verification_ms", "Single verification"),
+        ("batch_verification_ms", "Batch verification share"),
+        ("encryption_ms", "Encryption"),
+        ("decryption_ms", "Decryption"),
+        ("communication_latency_ms", "Communication"),
+    ]:
+        plt.plot(rounds["round"], rounds[column], marker="o", label=label)
+    plt.title("Average Per-Node Latency Overhead")
+    plt.xlabel("Communication round")
+    plt.ylabel("Latency (ms)")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend()
+    latency_path = f"{prefix_str}security_latency_vs_rounds.png"
+    plt.tight_layout()
+    plt.savefig(latency_path, dpi=300)
+    plt.close()
+    paths.append(latency_path)
+
+    plt.figure(figsize=(10, 6))
+    for column, label in [
+        ("energy_security_j", "Security"),
+        ("energy_communication_j", "Communication"),
+        ("energy_total_j", "Total overhead"),
+    ]:
+        plt.plot(rounds["round"], rounds[column], marker="o", label=label)
+    plt.title("Average Per-Node Energy Overhead")
+    plt.xlabel("Communication round")
+    plt.ylabel("Energy (J)")
+    plt.grid(True, linestyle="--", alpha=0.6)
+    plt.legend()
+    energy_path = f"{prefix_str}security_energy_vs_rounds.png"
+    plt.tight_layout()
+    plt.savefig(energy_path, dpi=300)
+    plt.close()
+    paths.append(energy_path)
+
+    server_rows = frame[frame["node"] == "Server"]
+    if not server_rows.empty:
+        plt.figure(figsize=(10, 6))
+        plt.plot(server_rows["round"], server_rows["throughput_updates_per_sec"], marker="o")
+        plt.title("Verified Aggregation Throughput")
+        plt.xlabel("Communication round")
+        plt.ylabel("Successfully aggregated updates / sec")
+        plt.grid(True, linestyle="--", alpha=0.6)
+        throughput_path = f"{prefix_str}throughput_vs_rounds.png"
+        plt.tight_layout()
+        plt.savefig(throughput_path, dpi=300)
+        plt.close()
+        paths.append(throughput_path)
+    return paths
 
 
 def parse_logs(filepath="training_logs.txt"):

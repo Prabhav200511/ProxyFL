@@ -67,6 +67,36 @@ class TrainingLogger:
             self.vehicle_privacy[vehicle] = {}
         self.vehicle_privacy[vehicle][round_num] = (epsilon, delta)
 
+    def round_metrics(self):
+        """Return accuracy/loss/privacy values keyed identically to metrics.csv."""
+        rows = {}
+        vehicles = (set(self.vehicle_train_loss) | set(self.vehicle_train_acc)
+                    | set(self.vehicle_private_acc) | set(self.vehicle_privacy))
+        for vehicle in vehicles:
+            rounds = (set(self.vehicle_train_loss.get(vehicle, {}))
+                      | set(self.vehicle_train_acc.get(vehicle, {}))
+                      | set(self.vehicle_private_acc.get(vehicle, {}))
+                      | set(self.vehicle_privacy.get(vehicle, {})))
+            for round_num in rounds:
+                epsilon, delta = self.vehicle_privacy.get(vehicle, {}).get(round_num, (None, None))
+                values = {
+                    "train_loss": self.vehicle_train_loss.get(vehicle, {}).get(round_num),
+                    "train_accuracy_pct": self.vehicle_train_acc.get(vehicle, {}).get(round_num),
+                    "private_test_accuracy_pct": self.vehicle_private_acc.get(vehicle, {}).get(round_num),
+                }
+                if epsilon is not None:
+                    values["epsilon"] = epsilon
+                    values["delta"] = delta
+                rows[(vehicle, round_num)] = {
+                    key: value for key, value in values.items() if value is not None
+                }
+        for round_num, accuracy in self.global_proxy_acc.items():
+            rows[("Server", round_num)] = {
+                **rows.get(("Server", round_num), {}),
+                "global_proxy_accuracy_pct": accuracy,
+            }
+        return rows
+
     def save_logs(self, filename="training_logs.txt"):
         with open(filename, "w", encoding="utf-8") as f:
             f.write("VEHICLE TRAINING UPDATES\n")

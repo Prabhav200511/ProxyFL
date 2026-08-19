@@ -4,9 +4,26 @@
 # FEDERATED LEARNING
 # ==========================================
 TOTAL_ROUNDS = 5
-TIMEOUT = 45
+# A device may wait for an RSU deadline, then a server deadline, plus network
+# fan-out.  Keep this relationship explicit so a future timeout edit cannot
+# make devices abandon an otherwise valid round prematurely.
+RSU_ROUND_TIMEOUT = 25
+SERVER_ROUND_TIMEOUT = 30
+ROUND_SYNC_BUFFER = 10
+TIMEOUT = RSU_ROUND_TIMEOUT + SERVER_ROUND_TIMEOUT + ROUND_SYNC_BUFFER
 BATCH_SIZE = 32
 LOCAL_EPOCHS = 3
+
+# ==========================================
+# SECURITY & INSTRUMENTATION
+# ==========================================
+SECURITY_ENABLED = True
+OBU_PEAK_POWER_W = 10.88
+X_OP_TRAIN = 0.95
+X_OP_CRYPTO = 0.40
+X_OP_COMM = 0.60
+X_OP_IDLE = 0.15
+MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 
 # ==========================================
 # VANET SPATIAL SIMULATION

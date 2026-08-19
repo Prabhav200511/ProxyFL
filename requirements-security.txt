@@ -1,0 +1,3 @@
+# Raw P-256 point arithmetic and AES-256-GCM used by crypto_protocol.py.
+# Install into the same Python environment as the existing PyTorch stack.
+pycryptodome>=3.20
