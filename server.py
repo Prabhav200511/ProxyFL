@@ -6,44 +6,69 @@
 
 import threading
 import os
+import time
 
 import torch
 import pandas as pd
 from sklearn.metrics import accuracy_score, f1_score, recall_score
 from torch.utils.data import DataLoader
 
-from config import TOTAL_ROUNDS, DEVICE, RSU_BASE_PORT
+from config import (
+    TOTAL_ROUNDS, DEVICE, RSU_BASE_PORT, SERVER_ROUND_TIMEOUT,
+    SECURITY_ENABLED, BATCH_VERIFICATION_ENABLED
+)
 from data_utils import VANETDataset, get_vanet_scaler
 from shared_logger import logger
 from network import Receiver, send_msg
 from torchvision import datasets, transforms
 from models import jsd_weighted_average, ProxyModel, MNISTProxyModel
+from crypto_protocol import (
+    Authority, CertificatelessSigner, CertificatelessVerifier,
+    verify_envelope, signature_from_wire
+)
+from model_codec import serialize_weights, deserialize_weights
+from metrics import Timer, BatchTimer, metrics_tracker
 
 
 training_done_event = threading.Event()
-
-SERVER_ROUND_TIMEOUT = 30  # seconds — aggregate whatever RSUs reported
 
 
 class Server:
     """Central aggregation server.
 
     Args:
-        port:          TCP port to listen on.
-        expected_rsus: Number of RSU cluster updates expected per round.
+        port:                TCP port to listen on.
+        expected_rsus:       Number of RSU cluster updates expected per round.
+        dataset_type:        "mnist" or "vanet".
+        total_rounds:        Total communication rounds.
+        security_authority:  Optional bootstrap Authority (TA/KGC) instance.
+        security_identity:   Optional pre-registered CertificatelessSigner.
     """
 
-    def __init__(self, port, expected_rsus, dataset_type="mnist", total_rounds=TOTAL_ROUNDS):
+    def __init__(self, port, expected_rsus, dataset_type="mnist", total_rounds=TOTAL_ROUNDS,
+                 security_authority=None, security_identity=None):
         self.port = port
         self.expected_rsus = expected_rsus
         self.dataset_type = dataset_type
         self.total_rounds = total_rounds
+        self.security_authority = security_authority
+        self.signer = security_identity
+        self.verifier = (
+            CertificatelessVerifier(security_authority.P_pub)
+            if security_authority is not None else None
+        )
+
+        if SECURITY_ENABLED and self.signer is None and self.security_authority is not None:
+            with Timer("Server", 0, "key_generation"):
+                self.signer = self.security_authority.register("Server")
+
         self.round_buffers = {}
+        self.round_start_times = {}
         self.completed_rounds = set()
         self.rsu_ports = [RSU_BASE_PORT + i for i in range(expected_rsus)]
         self._round_timers = {}
         self._lock = threading.Lock()  # protects round_buffers, completed_rounds, rsu_ports, _round_timers
-        self.receiver = Receiver(self.port, self.on_receive)
+        self.receiver = Receiver(self.port, self.on_receive, node_name="Server")
 
         torch.manual_seed(42)
         if self.dataset_type == "mnist":
@@ -73,28 +98,58 @@ class Server:
     # Message handling
     # ------------------------------------------------------------------
     def on_receive(self, msg):
-        if msg["type"] == "CLUSTER_UPDATE":
-            r = msg["round"]
+        msg_type = msg.get("type") if isinstance(msg, dict) else None
+        if msg_type == "CLUSTER_UPDATE":
+            r = msg.get("round")
+            sender = msg.get("sender") or msg.get("rsu_name")
+            if not isinstance(r, int) or r < 0:
+                return
+
             should_aggregate = False
+            verified_payload = None
+            sender_info = None
+
+            # Security verification
+            if SECURITY_ENABLED and self.security_authority is not None and self.signer is not None and "sig" in msg:
+                t0 = time.perf_counter()
+                result = verify_envelope(self.security_authority, self.signer, msg, "CLUSTER_UPDATE")
+                ver_duration = time.perf_counter() - t0
+                if sender:
+                    metrics_tracker.record_duration(sender, r, "signature_verification", ver_duration)
+
+                if result is None:
+                    print(f"[SERVER] [SECURITY] Authentication failed for CLUSTER_UPDATE from {sender} (Round {r}). Dropping.")
+                    return
+                verified_payload, sender_info = result
 
             with self._lock:
                 if r in self.completed_rounds:
                     return
 
-                if msg["rsu_port"] not in self.rsu_ports:
-                    self.rsu_ports.append(msg["rsu_port"])
+                if r not in self.round_start_times:
+                    self.round_start_times[r] = time.perf_counter()
+
+                rsu_port = msg.get("rsu_port")
+                if rsu_port and rsu_port not in self.rsu_ports:
+                    self.rsu_ports.append(rsu_port)
+
                 if r not in self.round_buffers:
                     self.round_buffers[r] = []
-                    # Start a deadline timer for this round
                     timer = threading.Timer(
                         SERVER_ROUND_TIMEOUT, self._force_aggregate, args=[r])
                     timer.daemon = True
                     timer.start()
                     self._round_timers[r] = timer
 
-                self.round_buffers[r].append(msg)
+                entry = {
+                    "sender": sender,
+                    "raw_msg": msg,
+                    "verified_payload": verified_payload,
+                    "sender_info": sender_info,
+                }
+                self.round_buffers[r].append(entry)
 
-                if len(self.round_buffers[r]) == self.expected_rsus:
+                if len(self.round_buffers[r]) >= self.expected_rsus:
                     self._cancel_timer_locked(r)
                     should_aggregate = True
 
@@ -132,18 +187,83 @@ class Server:
     # Aggregation
     # ------------------------------------------------------------------
     def aggregate(self, r):
+        server_t0 = time.perf_counter()
         with self._lock:
             if r in self.completed_rounds:
                 return
             self.completed_rounds.add(r)
             self._cancel_timer_locked(r)
-            data = self.round_buffers.pop(r, None)
+            data = self.round_buffers.pop(r, [])
             rsu_ports_snapshot = list(self.rsu_ports)
+            round_start_t = self.round_start_times.pop(r, server_t0)
 
         if not data:
             return
 
-        cluster_weights = [d["avg_weights"] for d in data]
+        cluster_weights = []
+        participants = [d["sender"] for d in data if d.get("sender")]
+
+        # Batch verification & weight extraction
+        if SECURITY_ENABLED and self.security_authority is not None and self.verifier is not None:
+            batch_items = []
+            for d in data:
+                raw_msg = d.get("raw_msg", {})
+                payload = d.get("verified_payload")
+                s_info = d.get("sender_info")
+                sig_wire = raw_msg.get("sig")
+                if payload is not None and s_info is not None and sig_wire is not None:
+                    try:
+                        sig = signature_from_wire(sig_wire)
+                        batch_items.append((payload, sig, s_info, d))
+                    except Exception:
+                        pass
+
+            if batch_items:
+                if BATCH_VERIFICATION_ENABLED and len(batch_items) > 1:
+                    with BatchTimer("Server", participants, r):
+                        batch_input = [(p, s, info) for p, s, info, _ in batch_items]
+                        batch_ok = self.verifier.batch_verify(batch_input)
+                else:
+                    batch_ok = True
+
+                if batch_ok:
+                    for payload, _, _, _ in batch_items:
+                        try:
+                            w = deserialize_weights(payload)
+                            cluster_weights.append(w)
+                        except Exception as e:
+                            print(f"[SERVER] Deserialization error: {e}")
+                else:
+                    print(f"[SERVER] [SECURITY] Batch verification failed for Round {r}. Falling back to single-verify.")
+                    for payload, sig, info, d in batch_items:
+                        t_single_0 = time.perf_counter()
+                        is_valid = self.verifier.verify(payload, sig, info)
+                        dur = time.perf_counter() - t_single_0
+                        sender = d.get("sender")
+                        if sender:
+                            metrics_tracker.record_duration(sender, r, "signature_verification", dur)
+                        if is_valid:
+                            try:
+                                cluster_weights.append(deserialize_weights(payload))
+                            except Exception:
+                                pass
+                        else:
+                            print(f"[SERVER] [SECURITY] Excluded invalid signature from {sender}")
+        else:
+            for d in data:
+                raw = d.get("raw_msg", {})
+                w = raw.get("avg_weights")
+                if isinstance(w, bytes):
+                    try:
+                        w = deserialize_weights(w)
+                    except Exception:
+                        pass
+                if isinstance(w, dict):
+                    cluster_weights.append(w)
+
+        if not cluster_weights:
+            print(f"[SERVER] [!] 0 valid cluster weights for Round {r}.")
+            return
 
         # JSD-weighted average
         global_weights, divergences = jsd_weighted_average(
@@ -156,19 +276,62 @@ class Server:
         acc, f1, recall = self.evaluate_global_model(global_weights)
         logger.log_global(r, acc)
 
+        round_wall_clock = time.perf_counter() - round_start_t
+        # Legacy updates/sec (kept for CSV compatibility)
+        throughput_ups = len(cluster_weights) / max(round_wall_clock, 0.001)
+
+        # Strict throughput: total bytes delivered to the server this round / wall-clock
+        total_bytes = 0.0
+        for d in data:
+            payload = d.get("verified_payload")
+            if isinstance(payload, (bytes, bytearray)):
+                total_bytes += len(payload)
+                continue
+            raw_msg = d.get("raw_msg", {})
+            if not isinstance(raw_msg, dict):
+                continue
+            blob = raw_msg.get("ciphertext")
+            if isinstance(blob, (bytes, bytearray)):
+                total_bytes += len(blob)
+                continue
+            weights = raw_msg.get("avg_weights")
+            if isinstance(weights, (bytes, bytearray)):
+                total_bytes += len(weights)
+            elif isinstance(weights, dict):
+                try:
+                    total_bytes += len(serialize_weights(weights))
+                except Exception:
+                    pass
+        if total_bytes <= 0:
+            for w in cluster_weights:
+                try:
+                    total_bytes += len(serialize_weights(w))
+                except Exception:
+                    pass
+        throughput_bps = total_bytes / max(round_wall_clock, 0.001)
+
+        metrics_tracker.record_value("Server", r, "global_proxy_accuracy_pct", acc * 100.0)
+        metrics_tracker.record_value("Server", r, "successful_updates", float(len(cluster_weights)))
+        metrics_tracker.record_value("Server", r, "throughput_updates_per_sec", throughput_ups)
+        metrics_tracker.record_value("Server", r, "throughput_bytes_per_sec", throughput_bps)
+        metrics_tracker.record_value("Server", r, "bytes_rx", total_bytes)
+        metrics_tracker.record_duration("Server", r, "server_round_execution", time.perf_counter() - server_t0)
+
         print(f"\n[SERVER] --- ROUND {r} GLOBAL PROXY METRICS ---")
         print(f"         Test Accuracy : {round(acc * 100, 2)}%")
         print(f"         F1-Score      : {round(f1, 4)}")
-        print(f"         Recall        : {round(recall, 4)}\n")
+        print(f"         Recall        : {round(recall, 4)}")
+        print(f"         Throughput    : {round(throughput_bps, 2)} B/s "
+              f"({round(throughput_ups, 2)} updates/sec, wall-clock {round(round_wall_clock, 2)}s)\n")
 
         # Broadcast global proxy to all RSUs
         msg = {
             "type": "GLOBAL_UPDATE",
             "round": r,
-            "global_weights": global_weights,
+            "global_weights": {k: v.cpu() for k, v in global_weights.items()},
         }
         for p in rsu_ports_snapshot:
-            send_msg(("127.0.0.1", p), msg)
+            send_msg(("127.0.0.1", p), msg, sender_name="Server", round_num=r)
 
         if r >= self.total_rounds:
             training_done_event.set()
@@ -195,10 +358,10 @@ class Server:
             msg = {
                 "type": "GLOBAL_UPDATE",
                 "round": r,
-                "global_weights": self.model.state_dict(),
+                "global_weights": {k: v.cpu() for k, v in self.model.state_dict().items()},
             }
             for p in rsu_ports_snapshot:
-                send_msg(("127.0.0.1", p), msg)
+                send_msg(("127.0.0.1", p), msg, sender_name="Server", round_num=r)
             if r >= self.total_rounds:
                 training_done_event.set()
 
@@ -218,6 +381,6 @@ class Server:
     def shutdown(self):
         """Close the listening socket so the port is freed."""
         try:
-            self.receiver.sock.close()
+            self.receiver.shutdown()
         except Exception:
             pass

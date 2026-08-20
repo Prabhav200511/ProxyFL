@@ -200,3 +200,14 @@ class TrainingLogger:
             plt.savefig("loss_vs_rounds.png", dpi=300)
         plt.close()
         print(f"[PLOT] Saved Loss Plot: '{loss_path}'")
+
+        # Also generate Latency, Energy, Throughput, Security Overhead plots if CSV exists
+        try:
+            from plot_metrics import plot_metrics_from_csv
+            csv_candidate = f"{prefix_str}metrics.csv"
+            if os.path.exists(csv_candidate):
+                plot_metrics_from_csv(csv_candidate, prefix=prefix)
+            elif os.path.exists("metrics.csv"):
+                plot_metrics_from_csv("metrics.csv", prefix=prefix)
+        except Exception as e:
+            print(f"[PLOT] Additional metrics plots error: {e}")

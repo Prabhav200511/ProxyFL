@@ -1,0 +1,3 @@
+# Elliptic-curve ops: MIRACL Core Python (miracl_python/nist256 from core-master/python).
+# AES-256-GCM: PyCryptodome (MIRACL Python has no GCM module).
+pycryptodome>=3.20

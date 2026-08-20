@@ -3,10 +3,43 @@
 # ==========================================
 # FEDERATED LEARNING
 # ==========================================
-TOTAL_ROUNDS = 5
-TIMEOUT = 45
+TOTAL_ROUNDS = 40
+RSU_ROUND_TIMEOUT = 25       # seconds — deadline for RSU to collect cluster updates
+SERVER_ROUND_TIMEOUT = 30    # seconds — deadline for Server to collect RSU updates
+# Timeout invariant: device wait timeout must cover the worst-case cascade (RSU + Server) + 15s buffer
+TIMEOUT = RSU_ROUND_TIMEOUT + SERVER_ROUND_TIMEOUT + 15  # 70s
 BATCH_SIZE = 32
 LOCAL_EPOCHS = 3
+
+# ==========================================
+# SECURITY & AUTHENTICATION
+# ==========================================
+SECURITY_ENABLED = True
+BATCH_VERIFICATION_ENABLED = True
+
+# ==========================================
+# TRUST SCORE (Eq. 9–10) — drop malicious updates
+# ==========================================
+TRUST_SCORE_ENABLED = True
+# If None: accept updates with L2 deviation ≤ median(deviations) × multiplier
+TRUST_L2_THRESHOLD = None
+TRUST_MEDIAN_MULTIPLIER = 3.0
+
+# ==========================================
+# V2V PROXY SHARING (Eq. 6)
+# ==========================================
+V2V_ENABLED = True
+V2V_COLLECT_TIMEOUT = 2.0   # seconds to wait for in-range peer proxies
+
+# ==========================================
+# ENERGY MODEL (OBU power profile)
+# E_op (Joules) = OBU_PEAK_POWER_W * x_op * (t_op_ms / 1000)
+# ==========================================
+OBU_PEAK_POWER_W = 10.88     # Watts — rated peak power draw
+X_OP_IDLE = 0.2              # Radio standby, CPU mostly idle
+X_OP_TRAIN = 1.0             # Local training (DML + per-sample DP-SGD)
+X_OP_COMM = 0.6              # Communication (TX/RX of model payloads)
+X_OP_CRYPTO = 0.4            # EC crypto point ops (keygen, sign, verify, batch)
 
 # ==========================================
 # VANET SPATIAL SIMULATION

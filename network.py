@@ -3,20 +3,32 @@ import socket
 import pickle
 import struct
 import threading
+import time
+from metrics import metrics_tracker
 
 
-def send_msg(addr, msg):
+def send_msg(addr, msg, sender_name=None, round_num=None):
     """Send a pickled message to (host, port) with a 4-byte length prefix.
 
+    Measures TX bytes and communication latency when sender/round are available.
     Returns True on success, False on failure (logged to stderr).
     """
+    sender = sender_name or (msg.get("sender") if isinstance(msg, dict) else None)
+    r = round_num if round_num is not None else (msg.get("round") if isinstance(msg, dict) else None)
+
+    t0 = time.perf_counter()
     try:
+        data = pickle.dumps(msg)
+        n_bytes = len(data)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(10)
             s.connect(addr)
-            data = pickle.dumps(msg)
-            s.sendall(struct.pack('>I', len(data)) + data)
-            return True
+            s.sendall(struct.pack('>I', n_bytes) + data)
+        duration = time.perf_counter() - t0
+        if sender and r is not None and isinstance(r, int) and r >= 0:
+            metrics_tracker.record_bytes(sender, r, "tx", n_bytes + 4)
+            metrics_tracker.record_duration(sender, r, "communication_tx", duration)
+        return True
     except ConnectionRefusedError:
         print(f"[NET] Connection refused to {addr[1]} "
               f"(target may be offline)")
@@ -31,9 +43,10 @@ class Receiver:
     to a callback function.
     """
 
-    def __init__(self, port, callback):
+    def __init__(self, port, callback, node_name=None):
         self.port = port
         self.callback = callback
+        self.node_name = node_name
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", self.port))
@@ -59,14 +72,22 @@ class Receiver:
                 break
 
     def _handle(self, conn):
+        t0 = time.perf_counter()
         try:
             raw_msglen = self._recvall(conn, 4)
             if not raw_msglen:
                 return
             msglen = struct.unpack('>I', raw_msglen)[0]
             data = self._recvall(conn, msglen)
+            duration = time.perf_counter() - t0
             if data:
-                self.callback(pickle.loads(data))
+                msg = pickle.loads(data)
+                if self.node_name and isinstance(msg, dict):
+                    r = msg.get("round")
+                    if isinstance(r, int) and r >= 0:
+                        metrics_tracker.record_bytes(self.node_name, r, "rx", msglen + 4)
+                        metrics_tracker.record_duration(self.node_name, r, "communication_rx", duration)
+                self.callback(msg)
         except Exception as e:
             print(f"[NET] Receive error on port {self.port}: {e}")
         finally:
@@ -79,4 +100,4 @@ class Receiver:
             if not packet:
                 return None
             data.extend(packet)
-        return data
+        return data
