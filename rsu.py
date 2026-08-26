@@ -1,262 +1,431 @@
-"""Road-side unit aggregation with authenticated local-update handling."""
+# rsu.py — Road-Side Unit (Cluster Head)
+#
+# Aggregates proxy model weights from vehicles in its cluster using FedAvg,
+# then forwards the cluster average to the central server.
+# Broadcasts global updates back to vehicles.
+# Uses timeout-based aggregation so out-of-range vehicles don't deadlock.
 
-from __future__ import annotations
-
-import threading
 import time
-from typing import Any, Dict
+import threading
 
-from config import RSU_ROUND_TIMEOUT, SECURITY_ENABLED
-from crypto_protocol import (
-    Authority, CertificatelessSigner, CertificatelessVerifier, SecurityError,
-    build_envelope, decrypt_payload, encrypt_payload, message_aad, parse_envelope,
+from config import (
+    RSU_ROUND_TIMEOUT, SECURITY_ENABLED, BATCH_VERIFICATION_ENABLED,
+    TRUST_SCORE_ENABLED, TRUST_L2_THRESHOLD, TRUST_MEDIAN_MULTIPLIER,
 )
-from metrics import BatchTimer, Timer, metrics_tracker
-from model_codec import deserialize_weights, serialize_weights
-from models import average_weights
+from models import average_weights, filter_trusted_weights
 from network import Receiver, send_msg
+from crypto_protocol import (
+    Authority, CertificatelessSigner, CertificatelessVerifier,
+    build_envelope, decrypt_envelope, verify_envelope, encrypt_payload, message_aad,
+    signature_from_wire
+)
+from model_codec import serialize_weights, deserialize_weights
+from metrics import Timer, BatchTimer, metrics_tracker
+from vanet_channel import WirelessLink
 
 
 class RSU:
-    """Aggregate only decrypted and certificate-less verified device updates."""
+    """Road-Side Unit that aggregates a cluster of vehicles.
 
-    def __init__(
-        self, name, port, cluster_ports, server_port, topology=None, vehicle_names=None,
-        security_authority: Authority | None = None,
-        security_identity: CertificatelessSigner | None = None,
-    ):
+    Args:
+        name:                RSU identifier (e.g. "Cluster_1").
+        port:                TCP port this RSU listens on.
+        cluster_ports:       List of vehicle TCP ports in this cluster.
+        server_port:         TCP port of the central server.
+        topology:            Shared VanetTopology for range checks.
+        vehicle_names:       List of vehicle names (parallel to cluster_ports).
+        security_authority:  Optional bootstrap Authority (TA/KGC) instance.
+        security_identity:   Optional pre-registered CertificatelessSigner.
+    """
+
+    def __init__(self, name, port, cluster_ports, server_port,
+                 topology=None, vehicle_names=None,
+                 security_authority=None, security_identity=None,
+                 security_enabled=None, batch_verification_enabled=None,
+                 initial_global_weights=None):
         self.name = name
         self.port = port
-        self.cluster_ports = list(cluster_ports)
+        self.cluster_ports = cluster_ports
         self.server_port = server_port
         self.topology = topology
-        self.vehicle_names = list(vehicle_names or [])
-        self.expected_senders = set(self.vehicle_names)
-        self.security_authority = security_authority
-        self.security_identity = security_identity
-        self.security_enabled = bool(
-            SECURITY_ENABLED and security_authority is not None and security_identity is not None
+        self.vehicle_names = vehicle_names or []
+        self.global_reference_weights = (
+            {
+                key: value.detach().cpu().clone()
+                for key, value in initial_global_weights.items()
+            }
+            if initial_global_weights is not None else None
         )
-        self.verifier = (CertificatelessVerifier(security_authority.P_pub)
-                         if self.security_enabled else None)
-        # round -> {sender -> pending authenticated (but not yet batch-verified) update}
-        self.round_buffers: Dict[int, Dict[str, Dict[str, Any]]] = {}
-        self.no_update_senders: Dict[int, set[str]] = {}
+        self.security_authority = security_authority
+        self.signer = security_identity
+        self.security_enabled = (
+            SECURITY_ENABLED if security_enabled is None else security_enabled)
+        self.batch_verification_enabled = (
+            BATCH_VERIFICATION_ENABLED
+            if batch_verification_enabled is None
+            else batch_verification_enabled
+        )
+        self.verifier = (
+            CertificatelessVerifier(security_authority.P_pub)
+            if security_authority is not None else None
+        )
+
+        if self.security_enabled and self.signer is None and self.security_authority is not None:
+            with Timer(self.name, 0, "key_generation"):
+                self.signer = self.security_authority.register(self.name)
+
+        self.round_buffers = {}
+        self.round_reported = {}
         self.completed_rounds = set()
-        self._round_timers: Dict[int, threading.Timer] = {}
-        self._lock = threading.Lock()
-        self.receiver = Receiver(self.port, self.on_receive, metric_node=self.name)
+        self._round_timers = {}
+        self._lock = threading.Lock()  # protects round_buffers, completed_rounds, _round_timers
+        self.receiver = Receiver(self.port, self.on_receive, node_name=self.name)
 
-    def _decode_local_update(self, msg: Dict[str, Any]) -> Dict[str, Any] | None:
-        """Perform cheap link checks + AEAD decryption; defer signature to batch."""
-        sender = msg.get("sender")
-        r = msg.get("round")
-        if not isinstance(sender, str) or not isinstance(r, int) or sender not in self.expected_senders:
-            print(f"[{self.name}] [SECURITY] Rejected local update with invalid sender/round")
+    def _decode_server_global(self, msg):
+        """Authenticate and decode a Server-to-RSU global update."""
+        if msg.get("sender") != "Server" or msg.get("recipient") != self.name:
             return None
         if self.security_enabled:
-            try:
-                parsed = parse_envelope(self.security_authority, self.security_identity, msg, "LOCAL_UPDATE")
-                with Timer(self.name, r, "decryption"):
-                    payload = decrypt_payload(
-                        self.security_identity.shared_secret_for(parsed.sender_info),
-                        msg["ciphertext"], msg["nonce"], msg["tag"], parsed.aad,
-                    )
-                return {
-                    "sender": sender, "payload": payload, "signature": parsed.signature,
-                    "public_info": parsed.sender_info,
-                }
-            except (KeyError, TypeError, SecurityError) as exc:
-                print(f"[{self.name}] [SECURITY] Rejected {sender} round {r}: {exc}")
+            if self.security_authority is None or self.signer is None:
                 return None
-        if msg.get("recipient") != self.name or not isinstance(msg.get("payload"), bytes):
-            print(f"[{self.name}] Rejected malformed baseline update from {sender}")
-            return None
-        return {"sender": sender, "payload": msg["payload"]}
-
-    def _accept_no_update(self, msg: Dict[str, Any]) -> bool:
-        """Verify an explicit no-upload signal without counting it as a model."""
-        sender, r = msg.get("sender"), msg.get("round")
-        if not isinstance(sender, str) or not isinstance(r, int) or sender not in self.expected_senders:
-            return False
-        if self.security_enabled:
-            try:
-                parsed = parse_envelope(self.security_authority, self.security_identity, msg, "NO_UPDATE")
-                with Timer(self.name, r, "decryption"):
-                    payload = decrypt_payload(
-                        self.security_identity.shared_secret_for(parsed.sender_info),
-                        msg["ciphertext"], msg["nonce"], msg["tag"], parsed.aad,
-                    )
-                with Timer(self.name, r, "signature_verification"):
-                    valid = self.verifier.verify(payload, parsed.signature, parsed.sender_info)
-                if valid and payload == b"NO_UPDATE":
-                    return True
-            except (KeyError, TypeError, SecurityError):
-                pass
-        elif msg.get("recipient") == self.name and msg.get("payload") == b"NO_UPDATE":
-            return True
-        print(f"[{self.name}] [SECURITY] Rejected no-update signal from {sender}, round {r}")
-        return False
-
-    def _ensure_timer_locked(self, r: int) -> None:
-        if r not in self.round_buffers:
-            self.round_buffers[r] = {}
-        if r not in self._round_timers:
-            timer = threading.Timer(RSU_ROUND_TIMEOUT, self._force_aggregate, args=[r])
-            timer.daemon = True
-            timer.start()
-            self._round_timers[r] = timer
-
-    def on_receive(self, msg: Dict[str, Any]) -> None:
-        message_type = msg.get("type")
-        if message_type == "LOCAL_UPDATE":
-            pending = self._decode_local_update(msg)
-            if pending is None:
-                return
-            r, sender = msg["round"], pending["sender"]
-            should_aggregate = False
-            with self._lock:
-                if r in self.completed_rounds:
-                    return
-                self._ensure_timer_locked(r)
-                if sender in self.round_buffers[r]:
-                    print(f"[{self.name}] [SECURITY] Dropped duplicate update from {sender} for round {r}")
-                    return
-                self.round_buffers[r][sender] = pending
-                if (len(self.round_buffers[r])
-                        + len(self.no_update_senders.get(r, set())) >= len(self.cluster_ports)):
-                    self._cancel_timer_locked(r)
-                    should_aggregate = True
-            if should_aggregate:
-                self.aggregate(r)
-
-        elif message_type == "NO_UPDATE":
-            if not self._accept_no_update(msg):
-                return
-            r, sender = msg["round"], msg["sender"]
-            should_aggregate = False
-            with self._lock:
-                if r in self.completed_rounds:
-                    return
-                self._ensure_timer_locked(r)
-                if sender in self.round_buffers[r] or sender in self.no_update_senders.setdefault(r, set()):
-                    print(f"[{self.name}] [SECURITY] Dropped duplicate response from {sender} for round {r}")
-                    return
-                self.no_update_senders[r].add(sender)
-                if (len(self.round_buffers[r]) + len(self.no_update_senders[r])
-                        >= len(self.cluster_ports)):
-                    self._cancel_timer_locked(r)
-                    should_aggregate = True
-            if should_aggregate:
-                self.aggregate(r)
-
-        elif message_type == "GLOBAL_UPDATE":
-            # Server-provided global model is an opaque tensor-only payload. It
-            # is broadcast to every device, including one that missed its upload.
-            for port in self.cluster_ports:
-                send_msg(("127.0.0.1", port), msg, metric_node=self.name,
-                         round_num=msg.get("round"))
-
-    def _verified_records(self, r: int, records: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
-        if not self.security_enabled:
-            return records
-        participants = [record["sender"] for record in records]
-        batch = [(record["payload"], record["signature"], record["public_info"])
-                 for record in records]
-        with BatchTimer(self.name, participants, r):
-            batch_ok = self.verifier.batch_verify(batch)
-        if batch_ok:
-            return records
-
-        # A failed batch proves at least one invalid signature. Verify only then
-        # to localize and exclude individual bad senders rather than lose a round.
-        valid_records = []
-        for record in records:
-            with Timer(self.name, r, "signature_verification"):
-                valid = self.verifier.verify(
-                    record["payload"], record["signature"], record["public_info"])
-            if valid:
-                valid_records.append(record)
-            else:
-                print(f"[{self.name}] [SECURITY] Dropped invalid signature from "
-                      f"{record['sender']} in round {r}")
-        return valid_records
-
-    def aggregate(self, r: int) -> None:
-        """Batch-verify, FedAvg verified models, then authenticate to the server."""
-        started_at = time.perf_counter()
+            round_num = msg.get("round", 0)
+            with Timer(self.name, round_num, "decryption"):
+                result = decrypt_envelope(
+                    self.security_authority, self.signer, msg,
+                    "GLOBAL_UPDATE")
+            if result is None:
+                return None
+            payload, sender_info, signature = result
+            verifier = CertificatelessVerifier(
+                self.security_authority.P_pub)
+            with Timer(self.name, round_num, "signature_verification"):
+                if not verifier.verify(payload, signature, sender_info):
+                    return None
+        else:
+            payload = msg.get("global_weights")
+            if not isinstance(payload, bytes):
+                return None
         try:
-            with self._lock:
-                if r in self.completed_rounds:
-                    return
-                self.completed_rounds.add(r)
-                self._cancel_timer_locked(r)
-                records = list(self.round_buffers.pop(r, {}).values())
-                self.no_update_senders.pop(r, None)
-            verified = self._verified_records(r, records)
-            weights = []
-            accepted_senders = []
-            for record in verified:
-                try:
-                    weights.append(deserialize_weights(record["payload"]))
-                    accepted_senders.append(record["sender"])
-                except (RuntimeError, ValueError) as exc:
-                    print(f"[{self.name}] [SECURITY] Dropped undecodable update from "
-                          f"{record['sender']}: {exc}")
-            if not weights:
-                print(f"[{self.name}] [!] No verified updates to aggregate for round {r}")
-                self._forward_cluster_payload(r, b"")
-                return
+            return deserialize_weights(payload)
+        except Exception:
+            return None
 
-            avg_weights = average_weights(weights)
-            metrics_tracker.record_value(self.name, r, "successful_updates", len(weights))
-            print(f"[{self.name}] Aggregated {len(weights)}/{len(self.cluster_ports)} verified vehicles "
-                  f"(Round {r}) -> forwarding to Server")
-            self._forward_cluster_payload(r, serialize_weights(avg_weights))
-        finally:
-            metrics_tracker.record_duration(
-                self.name, r, "rsu_round_execution", time.perf_counter() - started_at)
-
-    def _forward_cluster_payload(self, r: int, payload: bytes) -> None:
-        """Send an authenticated model or an authenticated empty-cluster status."""
-        if self.security_enabled:
-            server_public = self.security_authority.public_info("Server")
-            aad = message_aad("CLUSTER_UPDATE", self.name, "Server", r)
-            with Timer(self.name, r, "signature_generation"):
-                signature = self.security_identity.sign(payload)
-            with Timer(self.name, r, "encryption"):
+    def _build_vehicle_global(self, vehicle_name, round_num, weights):
+        """Build one vehicle-specific RSU-to-vehicle global update."""
+        payload = serialize_weights(weights)
+        if (self.security_enabled and self.signer is not None
+                and self.security_authority is not None):
+            with Timer(self.name, round_num, "signature_generation"):
+                signature = self.signer.sign(payload)
+            with Timer(self.name, round_num, "encryption"):
+                aad = message_aad(
+                    "GLOBAL_UPDATE", self.name, vehicle_name, round_num)
+                recipient_info = self.security_authority.public_info(
+                    vehicle_name)
+                shared_secret = self.signer.shared_secret_for(recipient_info)
                 ciphertext, nonce, tag = encrypt_payload(
-                    self.security_identity.shared_secret_for(server_public), payload, aad)
-            outbound = build_envelope(
-                "CLUSTER_UPDATE", self.security_identity, "Server", r,
+                    shared_secret, payload, aad)
+            return build_envelope(
+                "GLOBAL_UPDATE", self.signer, vehicle_name, round_num,
                 signature, ciphertext, nonce, tag,
             )
-        else:
-            outbound = {
-                "type": "CLUSTER_UPDATE", "sender": self.name, "recipient": "Server",
-                "round": r, "payload": payload,
-            }
-        send_msg(("127.0.0.1", self.server_port), outbound,
-                 metric_node=self.name, round_num=r)
+        return {
+            "type": "GLOBAL_UPDATE",
+            "sender": self.name,
+            "recipient": vehicle_name,
+            "round": round_num,
+            "global_weights": payload,
+        }
 
-    def _force_aggregate(self, r: int) -> None:
+    def on_receive(self, msg):
+        msg_type = msg.get("type") if isinstance(msg, dict) else None
+        if msg_type in ("LOCAL_UPDATE", "NO_UPDATE"):
+            r = msg.get("round")
+            sender = msg.get("sender")
+            if not isinstance(r, int) or r < 0 or not sender:
+                return
+            if self.vehicle_names and sender not in self.vehicle_names:
+                return
+
+            should_aggregate = False
+            verified_payload = None
+            sender_info = None
+
+            # Security verification
+            if self.security_enabled:
+                if self.security_authority is None or self.signer is None:
+                    return
+                if "sig" not in msg:
+                    return
+                t0 = time.perf_counter()
+                result = decrypt_envelope(self.security_authority, self.signer, msg, msg_type)
+                ver_duration = time.perf_counter() - t0
+                if sender:
+                    metrics_tracker.record_duration(sender, r, "decryption", ver_duration)
+
+                if result is None:
+                    print(f"[{self.name}] [SECURITY] Authentication failed for {msg_type} from {sender} (Round {r}). Dropping.")
+                    return
+                verified_payload, sender_info, signature = result
+                # NO_UPDATE changes the round barrier immediately, so verify
+                # this control message before counting it as a report.
+                if msg_type == "NO_UPDATE":
+                    verification_started = time.perf_counter()
+                    is_valid = self.verifier.verify(
+                        verified_payload, signature, sender_info)
+                    metrics_tracker.record_duration(
+                        sender, r, "signature_verification",
+                        time.perf_counter() - verification_started,
+                    )
+                    if not is_valid:
+                        return
+
+            with self._lock:
+                if r in self.completed_rounds:
+                    return
+
+                if r not in self.round_buffers:
+                    self.round_buffers[r] = []
+                    self.round_reported[r] = set()
+                    timer = threading.Timer(
+                        RSU_ROUND_TIMEOUT, self._force_aggregate, args=[r])
+                    timer.daemon = True
+                    timer.start()
+                    self._round_timers[r] = timer
+
+                if sender in self.round_reported[r]:
+                    return
+                self.round_reported[r].add(sender)
+
+                if msg_type == "LOCAL_UPDATE":
+                    entry = {
+                        "sender": sender,
+                        "raw_msg": msg,
+                        "verified_payload": verified_payload,
+                        "sender_info": sender_info,
+                    }
+                    self.round_buffers[r].append(entry)
+
+                # If all vehicles reported (either with LOCAL_UPDATE or NO_UPDATE)
+                expected_count = max(len(self.cluster_ports), len(self.vehicle_names))
+                if len(self.round_reported[r]) >= expected_count:
+                    self._cancel_timer_locked(r)
+                    should_aggregate = True
+
+            if should_aggregate:
+                self.aggregate(r)
+
+        elif msg_type == "GLOBAL_UPDATE":
+            weights = self._decode_server_global(msg)
+            if weights is None:
+                print(f"[{self.name}] [SECURITY] Dropped invalid GLOBAL_UPDATE")
+                return
+            round_num = msg.get("round")
+            self.global_reference_weights = {
+                key: value.detach().cpu().clone()
+                for key, value in weights.items()
+            }
+            # Re-authenticate the global proxy separately for each vehicle.
+            for index, port in enumerate(self.cluster_ports):
+                if index >= len(self.vehicle_names):
+                    continue
+                vehicle_name = self.vehicle_names[index]
+                wireless_link = None
+                if self.topology is not None:
+                    distance = self.topology.get_distance_to_rsu(
+                        vehicle_name, self.name)
+                    if distance != float("inf"):
+                        wireless_link = WirelessLink("rsu2v", distance)
+                vehicle_msg = self._build_vehicle_global(
+                    vehicle_name, round_num, weights)
+                send_msg(
+                    ("127.0.0.1", port), vehicle_msg,
+                    sender_name=self.name, round_num=round_num,
+                    wireless_link=wireless_link,
+                )
+
+    def aggregate(self, r):
+        """FedAvg the received proxy weights and forward to the server."""
+        rsu_t0 = time.perf_counter()
         with self._lock:
             if r in self.completed_rounds:
                 return
-            count = len(self.round_buffers.get(r, {}))
-            no_update_count = len(self.no_update_senders.get(r, set()))
-        if count or no_update_count:
-            print(f"[{self.name}] [!] Timeout! Aggregating {count}/{len(self.cluster_ports)} "
-                  f"vehicles for round {r}")
-            self.aggregate(r)
+            self.completed_rounds.add(r)
+            self._cancel_timer_locked(r)
+            data = self.round_buffers.pop(r, [])
+            self.round_reported.pop(r, None)
 
-    def _cancel_timer_locked(self, r: int) -> None:
+        valid_entries = []  # (sender, weights)
+        participants = [d["sender"] for d in data if d.get("sender")]
+
+        # Batch verification & weight extraction
+        if self.security_enabled and self.security_authority is not None and self.verifier is not None:
+            batch_items = []
+            for d in data:
+                raw_msg = d.get("raw_msg", {})
+                payload = d.get("verified_payload")
+                s_info = d.get("sender_info")
+                sig_wire = raw_msg.get("sig")
+                if payload is not None and s_info is not None and sig_wire is not None:
+                    try:
+                        sig = signature_from_wire(sig_wire)
+                        batch_items.append((payload, sig, s_info, d))
+                    except Exception:
+                        pass
+
+            if batch_items:
+                if self.batch_verification_enabled and len(batch_items) > 1:
+                    with BatchTimer(self.name, participants, r):
+                        batch_input = [(p, s, info) for p, s, info, _ in batch_items]
+                        batch_ok = self.verifier.batch_verify(batch_input)
+                else:
+                    batch_ok = all(
+                        self.verifier.verify(payload, sig, info)
+                        for payload, sig, info, _ in batch_items
+                    )
+
+                if batch_ok:
+                    for payload, _, _, d in batch_items:
+                        try:
+                            w = deserialize_weights(payload)
+                            valid_entries.append((d.get("sender", "?"), w))
+                        except Exception as e:
+                            print(f"[{self.name}] Deserialization error: {e}")
+                else:
+                    # Fallback to individual verification to drop any invalid item
+                    print(f"[{self.name}] [SECURITY] Batch verification failed for Round {r}. Falling back to single-verify.")
+                    for payload, sig, info, d in batch_items:
+                        t_single_0 = time.perf_counter()
+                        is_valid = self.verifier.verify(payload, sig, info)
+                        dur = time.perf_counter() - t_single_0
+                        sender = d.get("sender")
+                        if sender:
+                            metrics_tracker.record_duration(sender, r, "signature_verification", dur)
+                        if is_valid:
+                            try:
+                                valid_entries.append((sender or "?", deserialize_weights(payload)))
+                            except Exception:
+                                pass
+                        else:
+                            print(f"[{self.name}] [SECURITY] Excluded invalid signature from {sender}")
+        else:
+            # Plaintext fallback
+            for d in data:
+                raw = d.get("raw_msg", {})
+                w = raw.get("weights")
+                if not isinstance(w, bytes):
+                    continue
+                try:
+                    w = deserialize_weights(w)
+                except Exception:
+                    continue
+                if isinstance(w, dict):
+                    valid_entries.append((d.get("sender", "?"), w))
+
+        n_received = len(valid_entries)
+        n_expected = max(len(self.cluster_ports), len(self.vehicle_names))
+
+        # Trust score filter (Eq. 9–10)
+        if TRUST_SCORE_ENABLED and valid_entries:
+            valid_weights, trust_log = filter_trusted_weights(
+                valid_entries,
+                reference_weights=self.global_reference_weights,
+                threshold=TRUST_L2_THRESHOLD,
+                median_multiplier=TRUST_MEDIAN_MULTIPLIER,
+            )
+            for name, deviation, accepted in trust_log:
+                tau = 1 if accepted else 0
+                print(f"[{self.name}] [TRUST] {name}: ∂={deviation:.4f} → τ={tau}")
+                if not accepted:
+                    print(f"[{self.name}] [TRUST] Declined communication from {name} (malicious/outlier)")
+        else:
+            valid_weights = [w for _, w in valid_entries]
+
+        if valid_weights:
+            avg_weights = average_weights(valid_weights)
+            print(f"[{self.name}] Aggregated {len(valid_weights)}/{n_expected} trusted "
+                  f"vehicles (received {n_received}, Round {r}) -> forwarding to Server")
+
+            if self.security_enabled and self.signer is not None and self.security_authority is not None:
+                raw_avg = serialize_weights(avg_weights)
+                with Timer(self.name, r, "signature_generation"):
+                    sig = self.signer.sign(raw_avg)
+                with Timer(self.name, r, "encryption"):
+                    aad = message_aad("CLUSTER_UPDATE", self.name, "Server", r)
+                    server_info = self.security_authority.public_info("Server")
+                    shared_secret = self.signer.shared_secret_for(server_info)
+                    ciphertext, nonce, tag = encrypt_payload(shared_secret, raw_avg, aad)
+                msg = build_envelope(
+                    "CLUSTER_UPDATE", self.signer, "Server", r,
+                    sig, ciphertext, nonce, tag
+                )
+                msg["rsu_port"] = self.port
+            else:
+                msg = {
+                    "type": "CLUSTER_UPDATE",
+                    "rsu_port": self.port,
+                    "sender": self.name,
+                    "round": r,
+                    "avg_weights": serialize_weights(avg_weights),
+                }
+            send_msg(("127.0.0.1", self.server_port), msg, sender_name=self.name, round_num=r)
+        else:
+            print(f"[{self.name}] [!] 0 valid vehicle weights for Round {r}.")
+            if (self.security_enabled and self.signer is not None
+                    and self.security_authority is not None):
+                payload = b""
+                with Timer(self.name, r, "signature_generation"):
+                    signature = self.signer.sign(payload)
+                with Timer(self.name, r, "encryption"):
+                    aad = message_aad(
+                        "NO_CLUSTER_UPDATE", self.name, "Server", r)
+                    server_info = self.security_authority.public_info("Server")
+                    shared_secret = self.signer.shared_secret_for(server_info)
+                    ciphertext, nonce, tag = encrypt_payload(
+                        shared_secret, payload, aad)
+                msg = build_envelope(
+                    "NO_CLUSTER_UPDATE", self.signer, "Server", r,
+                    signature, ciphertext, nonce, tag,
+                )
+                msg["rsu_port"] = self.port
+            else:
+                msg = {
+                    "type": "NO_CLUSTER_UPDATE",
+                    "rsu_port": self.port,
+                    "sender": self.name,
+                    "recipient": "Server",
+                    "round": r,
+                }
+            send_msg(
+                ("127.0.0.1", self.server_port), msg,
+                sender_name=self.name, round_num=r,
+            )
+
+        metrics_tracker.record_duration(
+            self.name, r, "rsu_round_execution", time.perf_counter() - rsu_t0
+        )
+
+    def _force_aggregate(self, r):
+        """Timeout handler: aggregate whatever we have so far."""
+        with self._lock:
+            if r in self.completed_rounds:
+                return
+            has_data = r in self.round_buffers and len(self.round_buffers[r]) > 0
+            if has_data:
+                n = len(self.round_buffers[r])
+                print(f"[{self.name}] [!] Timeout! Aggregating {n}/"
+                      f"{len(self.cluster_ports)} vehicles for round {r}")
+
+        self.aggregate(r)
+
+    def _cancel_timer_locked(self, r):
+        """Cancel a round timer. Must be called with self._lock held."""
         timer = self._round_timers.pop(r, None)
         if timer:
             timer.cancel()
 
-    def start(self) -> None:
+    def start(self):
         self.receiver.start()
 
-    def shutdown(self) -> None:
+    def shutdown(self):
         self.receiver.shutdown()

@@ -1,167 +1,122 @@
-"""Length-prefixed, JSON-only transport for the ProxyFL simulation.
-
-Messages previously used ``pickle.loads`` directly on network bytes.  That is
-unsafe because arbitrary code can run before the certificate-less verifier gets
-a chance to reject a forged message.  The outer envelope is now a constrained
-JSON structure; model bytes remain opaque until their AES-GCM tag and
-signature are accepted by the receiving RSU/server.
-"""
-
-from __future__ import annotations
-
-import base64
-import json
+# network.py — TCP message passing for the ProxyFL VANET simulation
 import socket
 import struct
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Mapping
-
-from config import MAX_MESSAGE_BYTES
+from config import MAX_NETWORK_MESSAGE_BYTES
 from metrics import metrics_tracker
+from wire_codec import decode_message, encode_message
+from vanet_channel import WirelessLink, link_capacity_bps
 
 
-_BYTES_MARKER = "__proxyfl_wire_type__"
+def send_msg(addr, msg, sender_name=None, round_num=None, wireless_link=None):
+    """Send a safely encoded message with a 4-byte length prefix.
 
+    Measures TX bytes and communication latency when sender/round are available.
+    Returns True on success, False on failure (logged to stderr).
+    """
+    sender = sender_name or (msg.get("sender") if isinstance(msg, dict) else None)
+    r = round_num if round_num is not None else (msg.get("round") if isinstance(msg, dict) else None)
 
-def _to_wire(value: Any) -> Any:
-    if isinstance(value, bytes):
-        return {_BYTES_MARKER: "bytes", "base64": base64.b64encode(value).decode("ascii")}
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, (list, tuple)):
-        return [_to_wire(item) for item in value]
-    if isinstance(value, Mapping):
-        if not all(isinstance(key, str) for key in value):
-            raise TypeError("network message dictionaries require string keys")
-        return {key: _to_wire(item) for key, item in value.items()}
-    raise TypeError(f"unsupported network message value: {type(value)!r}")
-
-
-def _from_wire(value: Any) -> Any:
-    if isinstance(value, list):
-        return [_from_wire(item) for item in value]
-    if isinstance(value, dict):
-        if value.get(_BYTES_MARKER) == "bytes":
-            if set(value) != {_BYTES_MARKER, "base64"} or not isinstance(value["base64"], str):
-                raise ValueError("malformed bytes value")
-            return base64.b64decode(value["base64"], validate=True)
-        return {key: _from_wire(item) for key, item in value.items()}
-    return value
-
-
-def encode_message(msg: Mapping[str, Any]) -> bytes:
-    if not isinstance(msg, Mapping):
-        raise TypeError("network message must be a mapping")
-    return json.dumps(_to_wire(msg), sort_keys=True, separators=(",", ":")).encode("utf-8")
-
-
-def decode_message(data: bytes) -> dict:
-    try:
-        decoded = _from_wire(json.loads(data.decode("utf-8")))
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
-        raise ValueError("malformed JSON network message") from exc
-    if not isinstance(decoded, dict) or not isinstance(decoded.get("type"), str):
-        raise ValueError("network message is not a typed object")
-    return decoded
-
-
-@dataclass(frozen=True)
-class SendResult:
-    success: bool
-    payload_bytes: int
-    send_time_ms: float
-
-    def __bool__(self) -> bool:
-        return self.success
-
-
-def send_msg(addr, msg: Mapping[str, Any], metric_node: str | None = None, round_num: int | None = None) -> SendResult:
-    """Send one safe envelope and return its actual byte overhead and latency."""
-    started_at = time.perf_counter()
+    t0 = time.perf_counter()
     try:
         data = encode_message(msg)
-        if len(data) > MAX_MESSAGE_BYTES:
-            raise ValueError(f"message exceeds {MAX_MESSAGE_BYTES} byte limit")
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(10)
-            sock.connect(addr)
-            sock.sendall(struct.pack(">I", len(data)) + data)
-        elapsed = (time.perf_counter() - started_at) * 1000.0
-        metric_round = msg.get("round", round_num)
-        if metric_node is not None and isinstance(metric_round, int):
-            metrics_tracker.record_bytes(metric_node, metric_round, "tx", len(data))
-            metrics_tracker.record_duration(metric_node, metric_round, "communication_tx", elapsed / 1000.0)
-        return SendResult(True, len(data), elapsed)
+        n_bytes = len(data)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(10)
+            s.connect(addr)
+            s.sendall(struct.pack('>I', n_bytes) + data)
+        duration = time.perf_counter() - t0
+        if sender and r is not None and isinstance(r, int) and r >= 0:
+            try:
+                metrics_tracker.record_bytes(sender, r, "tx", n_bytes + 4)
+                metrics_tracker.record_duration(
+                    sender, r, "communication_tx", duration)
+                if wireless_link is not None:
+                    if not isinstance(wireless_link, WirelessLink):
+                        raise TypeError(
+                            "wireless_link must be a WirelessLink")
+                    metrics_tracker.record_wireless_delivery(
+                        sender, r, n_bytes + 4,
+                        link_capacity_bps(wireless_link.distance_m),
+                    )
+            except Exception as measurement_error:
+                print(f"[NET] Measurement failed after delivery: "
+                      f"{measurement_error}")
+        return True
     except ConnectionRefusedError:
-        elapsed = (time.perf_counter() - started_at) * 1000.0
-        print(f"[NET] Connection refused to {addr[1]} (target may be offline)")
-        return SendResult(False, 0, elapsed)
-    except Exception as exc:
-        elapsed = (time.perf_counter() - started_at) * 1000.0
-        print(f"[NET] Send failed to {addr[1]}: {exc}")
-        return SendResult(False, 0, elapsed)
+        print(f"[NET] Connection refused to {addr[1]} "
+              f"(target may be offline)")
+        return False
+    except Exception as e:
+        print(f"[NET] Send failed to {addr[1]}: {e}")
+        return False
 
 
 class Receiver:
-    """TCP listener that only dispatches a validated JSON envelope."""
+    """TCP server that deserializes incoming messages and dispatches them
+    to a callback function.
+    """
 
-    def __init__(self, port: int, callback: Callable[[dict], None], metric_node: str | None = None):
+    def __init__(self, port, callback, node_name=None,
+                 max_message_bytes=MAX_NETWORK_MESSAGE_BYTES):
         self.port = port
         self.callback = callback
-        self.metric_node = metric_node
+        self.node_name = node_name
+        self.max_message_bytes = max_message_bytes
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", self.port))
         self.sock.listen()
 
-    def start(self) -> None:
+    def start(self):
         threading.Thread(target=self._listen, daemon=True).start()
 
-    def shutdown(self) -> None:
+    def shutdown(self):
+        """Close the listening socket so the port is freed."""
         try:
             self.sock.close()
-        except OSError:
+        except Exception:
             pass
 
-    def _listen(self) -> None:
+    def _listen(self):
         while True:
             try:
                 conn, _ = self.sock.accept()
-                threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
+                threading.Thread(
+                    target=self._handle, args=(conn,), daemon=True).start()
             except OSError:
                 break
 
-    def _handle(self, conn: socket.socket) -> None:
-        started_at = time.perf_counter()
+    def _handle(self, conn):
+        t0 = time.perf_counter()
         try:
-            with conn:
-                raw_msglen = self._recvall(conn, 4)
-                if raw_msglen is None:
-                    return
-                msglen = struct.unpack(">I", raw_msglen)[0]
-                if msglen <= 0 or msglen > MAX_MESSAGE_BYTES:
-                    raise ValueError("invalid network message length")
-                data = self._recvall(conn, msglen)
-                if data is None:
-                    return
+            raw_msglen = self._recvall(conn, 4)
+            if not raw_msglen:
+                return
+            msglen = struct.unpack('>I', raw_msglen)[0]
+            if msglen <= 0 or msglen > self.max_message_bytes:
+                raise ValueError(f"invalid frame length: {msglen}")
+            data = self._recvall(conn, msglen)
+            duration = time.perf_counter() - t0
+            if data:
                 msg = decode_message(data)
-            elapsed = time.perf_counter() - started_at
-            round_num = msg.get("round")
-            if self.metric_node is not None and isinstance(round_num, int):
-                metrics_tracker.record_bytes(self.metric_node, round_num, "rx", len(data))
-                metrics_tracker.record_duration(self.metric_node, round_num, "communication_rx", elapsed)
-            self.callback(msg)
-        except Exception as exc:
-            print(f"[NET] Receive error on port {self.port}: {exc}")
+                if self.node_name and isinstance(msg, dict):
+                    r = msg.get("round")
+                    if isinstance(r, int) and r >= 0:
+                        metrics_tracker.record_bytes(self.node_name, r, "rx", msglen + 4)
+                        metrics_tracker.record_duration(self.node_name, r, "communication_rx", duration)
+                self.callback(msg)
+        except Exception as e:
+            print(f"[NET] Receive error on port {self.port}: {e}")
+        finally:
+            conn.close()
 
-    @staticmethod
-    def _recvall(conn: socket.socket, size: int) -> bytes | None:
+    def _recvall(self, conn, n):
         data = bytearray()
-        while len(data) < size:
-            packet = conn.recv(size - len(data))
+        while len(data) < n:
+            packet = conn.recv(n - len(data))
             if not packet:
                 return None
             data.extend(packet)
-        return bytes(data)
+        return data

@@ -268,3 +268,56 @@ def jsd_weighted_average(cluster_weights_list, global_weights, alpha=2.0):
             w_avg[key] += cluster_weights_list[i][key].to(device_type) * normalized_weights[i]
 
     return w_avg, divergences
+
+
+def model_l2_deviation(weights_a, weights_b):
+    """L2 distance between two state dicts (Eq. 9 model deviation ∂̃_i)."""
+    a_flat = torch.cat([v.detach().cpu().flatten().float() for v in weights_a.values()])
+    b_flat = torch.cat([v.detach().cpu().flatten().float() for v in weights_b.values()])
+    return torch.norm(a_flat - b_flat, p=2).item()
+
+
+def filter_trusted_weights(
+        weight_entries, reference_weights=None, threshold=None,
+        median_multiplier=3.0):
+    """Trust-score filter (Eq. 9–10).
+
+    Args:
+        weight_entries: list of (sender_name, state_dict)
+        reference_weights: previous authenticated global state; when omitted,
+            retain the legacy same-batch mean fallback
+        threshold: absolute L2 cutoff; if None use median(dev)×multiplier
+        median_multiplier: used when threshold is None
+
+    Returns:
+        trusted_weights, trust_log where trust_log is list of
+        (sender, deviation, accepted:bool)
+    """
+    if not weight_entries:
+        return [], []
+
+    weights_only = [w for _, w in weight_entries]
+    reference = (
+        reference_weights
+        if reference_weights is not None
+        else average_weights(weights_only)
+    )
+    deviations = [
+        (name, model_l2_deviation(reference, w), w)
+        for name, w in weight_entries
+    ]
+    values = [d for _, d, _ in deviations]
+    if threshold is None:
+        med = sorted(values)[len(values) // 2]
+        cutoff = med * median_multiplier if med > 0 else float("inf")
+    else:
+        cutoff = float(threshold)
+
+    trusted = []
+    trust_log = []
+    for name, deviation, w in deviations:
+        accepted = deviation <= cutoff
+        trust_log.append((name, deviation, accepted))
+        if accepted:
+            trusted.append(w)
+    return trusted, trust_log

@@ -3,35 +3,72 @@
 # ==========================================
 # FEDERATED LEARNING
 # ==========================================
-TOTAL_ROUNDS = 5
-# A device may wait for an RSU deadline, then a server deadline, plus network
-# fan-out.  Keep this relationship explicit so a future timeout edit cannot
-# make devices abandon an otherwise valid round prematurely.
-RSU_ROUND_TIMEOUT = 25
-SERVER_ROUND_TIMEOUT = 30
-ROUND_SYNC_BUFFER = 10
-TIMEOUT = RSU_ROUND_TIMEOUT + SERVER_ROUND_TIMEOUT + ROUND_SYNC_BUFFER
+TOTAL_ROUNDS = 40
+SIMULATION_SEED = 42
+RSU_ROUND_TIMEOUT = 25       # seconds — deadline for RSU to collect cluster updates
+SERVER_ROUND_TIMEOUT = 30    # seconds — deadline for Server to collect RSU updates
+# Timeout invariant: device wait timeout must cover the worst-case cascade (RSU + Server) + 15s buffer
+TIMEOUT = RSU_ROUND_TIMEOUT + SERVER_ROUND_TIMEOUT + 15  # 70s
 BATCH_SIZE = 32
 LOCAL_EPOCHS = 3
 
 # ==========================================
-# SECURITY & INSTRUMENTATION
+# SECURITY & AUTHENTICATION
 # ==========================================
 SECURITY_ENABLED = True
-OBU_PEAK_POWER_W = 10.88
-X_OP_TRAIN = 0.95
-X_OP_CRYPTO = 0.40
-X_OP_COMM = 0.60
-X_OP_IDLE = 0.15
-MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+BATCH_VERIFICATION_ENABLED = True
+
+# ==========================================
+# TRUST SCORE (Eq. 9–10) — drop malicious updates
+# ==========================================
+TRUST_SCORE_ENABLED = True
+# If None: accept updates with L2 deviation ≤ median(deviations) × multiplier
+TRUST_L2_THRESHOLD = None
+TRUST_MEDIAN_MULTIPLIER = 3.0
+
+# ==========================================
+# V2V PROXY SHARING (Eq. 6)
+# ==========================================
+V2V_ENABLED = True
+V2V_COLLECT_TIMEOUT = 2.0   # seconds to wait for in-range peer proxies
+V2V_READY_TIMEOUT = 2.0     # seconds to wait for in-range peers to finish training
+
+# ==========================================
+# ENERGY MODEL (OBU power profile)
+# E_op (Joules) = OBU_PEAK_POWER_W * x_op * (t_op_ms / 1000)
+# ==========================================
+OBU_PEAK_POWER_W = 10.88     # Watts — rated peak power draw
+X_OP_IDLE = 0.2              # Radio standby, CPU mostly idle
+X_OP_TRAIN = 1.0             # Local training (DML + per-sample DP-SGD)
+X_OP_COMM = 0.6              # Communication (TX/RX of model payloads)
+X_OP_CRYPTO = 0.4            # EC crypto point ops (keygen, sign, verify, batch)
 
 # ==========================================
 # VANET SPATIAL SIMULATION
 # ==========================================
 V2V_RANGE = 350          # meters — vehicle-to-vehicle communication range
 V2RSU_RANGE = 1000       # meters — vehicle-to-RSU communication range
-SPEED_RANGE = (2, 8)     # m/s (7–28 km/h) — slower city speed bounds
-RSU_SPACING = 1000       # meters — distance between RSU centers
+SPEED_RANGE = (0,0)     # m/s (7–28 km/h) — slower city speed bounds
+
+# Observational IEEE 802.11p-style link budget used only for capacity metrics.
+# These values never add delay, packet loss, or participation constraints.
+VANET_BANDWIDTH_HZ = 10_000_000.0
+VANET_TX_POWER_DBM = 23.0
+VANET_PATH_LOSS_1M_DB = 46.4
+VANET_PATH_LOSS_EXPONENT = 2.7
+VANET_NOISE_FIGURE_DB = 9.0
+VANET_PHY_MAX_RATE_BPS = 27_000_000.0
+
+# Fixed five-RSU layout. Each simulated run assigns an independently random
+# number of vehicles (2–10 inclusive) to every RSU.
+RSU_LAYOUT = (
+    ("RSU_0_Central", "Central", 0, 0),
+    ("RSU_1_North", "North", 0, 1800),
+    ("RSU_2_East", "East", 1800, 0),
+    ("RSU_3_South", "South", 0, -1800),
+    ("RSU_4_West", "West", -1800, 0),
+)
+VEHICLES_PER_CLUSTER_RANGE = (2, 10)
 
 # ==========================================
 # DIFFERENTIAL PRIVACY (applied to proxy model only)
@@ -40,6 +77,7 @@ DP_CLIP_NORM = 1.0           # Max L2 norm for per-sample gradient clipping
 DP_NOISE_MULTIPLIER = 0.05   # Gaussian noise scale (σ = multiplier × clip_norm)
 DP_DELTA = 1e-5              # δ parameter for (ε,δ)-DP accounting
 DP_MAX_EPSILON = None        # Optional ε budget cap; device stops sharing proxy when exceeded
+DP_EPSILON_WARNING_THRESHOLD = 10.0  # Reporting only; never changes training
 
 # ==========================================
 # DEEP MUTUAL LEARNING (Eq. 4–5 from ProxyFL paper)
@@ -54,6 +92,7 @@ DML_TEMPERATURE = 3.0        # Softmax temperature for knowledge distillation
 SERVER_PORT = 8000
 RSU_BASE_PORT = 5000
 DEVICE_BASE_PORT = 6000
+MAX_NETWORK_MESSAGE_BYTES = 16 * 1024 * 1024
 
 # ==========================================
 # HARDWARE & CONCURRENCY SAFETY (SIGABRT Prevention)
