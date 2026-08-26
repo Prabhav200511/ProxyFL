@@ -5,20 +5,21 @@ from __future__ import annotations
 import copy
 import time
 import unittest
+from unittest.mock import patch
 
 from crypto_protocol import (
-    BATCH_COEFFICIENT_BITS, Authority, CertificatelessVerifier, SecurityError,
-    build_envelope, encrypt_payload, message_aad, point_to_bytes, q,
-    verify_envelope,
+    Authority, CertificatelessVerifier, SecurityError, _nonzero_scalar, _sha256,
+    build_envelope, decrypt_payload, encrypt_payload, message_aad, point_to_bytes, q,
+    hash_to_scalar, verify_envelope,
 )
 
 
 class CertificatelessProtocolTests(unittest.TestCase):
     def setUp(self) -> None:
         self.authority = Authority()
-        self.authority.enroll_mvd("C1_D1")
+        self.authority.enroll_mvd("C1_V1")
         self.authority.enroll_mvd("Cluster_1")
-        self.device = self.authority.register("C1_D1", real_id="C1_D1")
+        self.device = self.authority.register("C1_V1", real_id="C1_V1")
         self.rsu = self.authority.register("Cluster_1", real_id="Cluster_1")
         self.verifier = CertificatelessVerifier(self.authority.P_pub)
 
@@ -34,11 +35,39 @@ class CertificatelessProtocolTests(unittest.TestCase):
 
     def test_mvd_enrollment_and_aid_recovery(self) -> None:
         recovered = self.authority.recover_identity(self.device.aid)
-        self.assertEqual(recovered, "C1_D1")
+        self.assertEqual(recovered, "C1_V1")
         orphan = Authority()
         orphan.enroll_mvd("only-alice")
         with self.assertRaises(SecurityError):
             orphan.generate_pseudo_identity("bob")
+        with self.assertRaises(SecurityError):
+            orphan.register("bob")
+
+    def test_miracl_sha_and_gcm(self) -> None:
+        self.assertEqual(
+            _sha256(b"abc").hex(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+        ciphertext, nonce, tag = encrypt_payload(b"shared secret", b"payload", b"aad")
+        self.assertEqual(
+            decrypt_payload(b"shared secret", ciphertext, nonce, tag, b"aad"), b"payload")
+        with self.assertRaises(SecurityError):
+            decrypt_payload(b"shared secret", ciphertext, nonce, tag[:-1] + b"\x00", b"aad")
+        self.assertEqual(len(tag), 16)
+
+    def test_portable_sha_and_gcm_fallback(self) -> None:
+        with patch("crypto_protocol._bridge", None):
+            self.assertEqual(
+                _sha256(b"abc").hex(),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            )
+            ciphertext, nonce, tag = encrypt_payload(
+                b"shared secret", b"payload", b"aad")
+            self.assertEqual(
+                decrypt_payload(
+                    b"shared secret", ciphertext, nonce, tag, b"aad"),
+                b"payload",
+            )
 
     def test_pairwise_secret_is_symmetric(self) -> None:
         self.assertEqual(
@@ -65,8 +94,8 @@ class CertificatelessProtocolTests(unittest.TestCase):
         self.assertIsNone(verify_envelope(
             self.authority, self.rsu, signature_tampered, "LOCAL_UPDATE"))
 
-        self.authority.enroll_mvd("C1_D2")
-        impostor = self.authority.register("C1_D2", real_id="C1_D2")
+        self.authority.enroll_mvd("C1_V2")
+        impostor = self.authority.register("C1_V2", real_id="C1_V2")
         key_tampered = self._envelope()
         key_tampered["pk"] = copy.deepcopy(key_tampered["pk"])
         key_tampered["pk"]["Q"] = point_to_bytes(impostor.get_public_info()["Q"])
@@ -74,10 +103,9 @@ class CertificatelessProtocolTests(unittest.TestCase):
             self.authority, self.rsu, key_tampered, "LOCAL_UPDATE"))
 
     def test_batch_verification_and_benchmark(self) -> None:
-        self.assertEqual(BATCH_COEFFICIENT_BITS, 96)
         signers = []
         for index in range(12):
-            name = f"C2_D{index}"
+            name = f"C2_V{index}"
             self.authority.enroll_mvd(name)
             signers.append(self.authority.register(name, real_id=name))
         batch = []
@@ -119,6 +147,14 @@ class CertificatelessProtocolTests(unittest.TestCase):
             f"batch={batch_seconds * 1000:.2f}ms, "
             f"speedup={single_seconds / batch_seconds:.2f}x"
         )
+
+    def test_hash_to_scalar_never_returns_zero(self) -> None:
+        with patch("crypto_protocol._sha256", return_value=b"\x00" * 32):
+            self.assertEqual(hash_to_scalar(b"H1", b"value"), 1)
+
+    def test_random_scalar_includes_one_and_excludes_zero(self) -> None:
+        with patch("crypto_protocol.miracl_big.rand", return_value=2):
+            self.assertEqual(_nonzero_scalar(), 1)
 
 
 if __name__ == "__main__":

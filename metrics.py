@@ -56,6 +56,25 @@ class MetricsTracker:
             raise ValueError("communication direction must be 'tx' or 'rx'")
         self.add_value(node, round_num, f"bytes_{direction}", max(num_bytes, 0))
 
+    def record_wireless_delivery(
+        self, node: str, round_num: int, num_wire_bytes: int,
+        capacity_bps: float,
+    ) -> None:
+        """Accumulate one successful wireless hop without changing timing."""
+        bits = float(max(num_wire_bytes, 0) * 8)
+        if capacity_bps <= 0:
+            raise ValueError("wireless capacity must be positive")
+        with self._lock:
+            row = self._row(node, round_num)
+            row["vanet_wireless_bits"] = (
+                row.get("vanet_wireless_bits", 0.0) + bits)
+            row["vanet_airtime_s"] = (
+                row.get("vanet_airtime_s", 0.0) + bits / capacity_bps)
+            row["vanet_capacity_sum_bps"] = (
+                row.get("vanet_capacity_sum_bps", 0.0) + capacity_bps)
+            row["vanet_capacity_samples"] = (
+                row.get("vanet_capacity_samples", 0.0) + 1.0)
+
     def record_batch_duration(
         self, receiver: str, participants: Iterable[str], round_num: int, duration_seconds: float
     ) -> None:
@@ -108,6 +127,17 @@ class MetricsTracker:
         )
         idle = max(execution - active, 0.0)
         end_to_end = training + security + communication + idle
+        wireless_bits = row.get("vanet_wireless_bits", 0.0)
+        wireless_airtime = row.get("vanet_airtime_s", 0.0)
+        capacity_samples = row.get("vanet_capacity_samples", 0.0)
+        mean_capacity = (
+            row.get("vanet_capacity_sum_bps", 0.0) / capacity_samples
+            if capacity_samples > 0 else 0.0
+        )
+        goodput = (
+            wireless_bits / wireless_airtime
+            if wireless_airtime > 0 else 0.0
+        )
         return {
             "security_latency_ms": security,
             "communication_latency_ms": communication,
@@ -120,6 +150,8 @@ class MetricsTracker:
             "energy_total_j": energy_joules(security, X_OP_CRYPTO)
             + energy_joules(communication, X_OP_COMM),
             "idle_latency_ms": idle,
+            "vanet_link_capacity_bps": mean_capacity,
+            "vanet_goodput_bps": goodput,
         }
 
     def rows(self, quality_metrics: Mapping[tuple[str, int], Mapping[str, float]] | None = None) -> list[dict]:
@@ -143,7 +175,11 @@ class MetricsTracker:
             "node", "round", "train_loss", "train_accuracy_pct", "private_test_accuracy_pct",
             "epsilon", "delta", "global_proxy_accuracy_pct", "successful_updates",
             "throughput_updates_per_sec", "throughput_bytes_per_sec",
-            "bytes_tx", "bytes_rx", "training_ms",
+            "vanet_wireless_bits", "vanet_airtime_s",
+            "vanet_link_capacity_bps", "vanet_goodput_bps",
+            "vehicles_in_range", "vehicles_assigned",
+            "vehicles_in_range_total", "vehicles_assigned_total",
+            "bytes_tx", "bytes_rx", "model_payload_bytes_rx", "training_ms",
             "key_generation_ms", "signature_generation_ms", "signature_verification_ms", "batch_verification_ms",
             "batch_verification_receiver_ms", "encryption_ms", "decryption_ms",
             "communication_tx_ms", "communication_rx_ms", "security_latency_ms",

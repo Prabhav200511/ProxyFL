@@ -18,11 +18,13 @@ import pandas as pd
 from torch.utils.data import DataLoader
 
 from config import (
-    TOTAL_ROUNDS, TIMEOUT, BATCH_SIZE, LOCAL_EPOCHS,
+    TOTAL_ROUNDS, TIMEOUT, BATCH_SIZE, LOCAL_EPOCHS, SIMULATION_SEED,
     DP_CLIP_NORM, DP_NOISE_MULTIPLIER, DP_DELTA, DP_MAX_EPSILON,
+    DP_EPSILON_WARNING_THRESHOLD,
     DML_ALPHA, DML_BETA, DML_TEMPERATURE,
     V2RSU_RANGE, DEVICE, TRAINING_SEMAPHORE,
     SECURITY_ENABLED, V2V_ENABLED, V2V_COLLECT_TIMEOUT,
+    V2V_READY_TIMEOUT,
 )
 from data_utils import VANETDataset, get_vanet_scaler
 from shared_logger import logger
@@ -33,18 +35,34 @@ from network import Receiver, send_msg
 from privacy import RDPAccountant
 from torchvision import datasets, transforms
 from crypto_protocol import (
-    Authority, CertificatelessSigner, build_envelope, encrypt_payload,
-    message_aad, verify_envelope,
+    Authority, CertificatelessSigner, CertificatelessVerifier,
+    build_envelope, decrypt_envelope, encrypt_payload, message_aad,
+    verify_envelope,
 )
 from model_codec import serialize_weights, deserialize_weights
 from metrics import Timer, metrics_tracker
+from vanet_channel import WirelessLink
+
+
+ROUND_TRAINING = "training"
+ROUND_REPORTING = "reporting"
+ROUND_WAITING_GLOBAL = "waiting_global"
+ROUND_IDLE = "idle"
+
+
+def proxy_training_objective(
+        logits, targets, soft_targets, class_weights=None):
+    """Shared Equation 5 objective for DP and non-DP proxy training."""
+    ce = F.cross_entropy(logits, targets, weight=class_weights)
+    kl = dml_loss(logits, soft_targets, DML_TEMPERATURE)
+    return (1 - DML_BETA) * ce + DML_BETA * kl
 
 
 class Device:
     """A VANET vehicle participating in ProxyFL.
 
     Args:
-        name:                Human-readable identifier (e.g. "C1_D1").
+        name:                Human-readable identifier (e.g. "C1_V1").
         port:                TCP port this vehicle listens on.
         rsu_port:            TCP port of the assigned RSU.
         rsu_name:            Name of the assigned RSU (for spatial lookups).
@@ -64,7 +82,8 @@ class Device:
                  device_id, total_vehicles, topology, peer_directory=None,
                  dataset_type="mnist", private_model_class=None,
                  total_rounds=TOTAL_ROUNDS, security_authority=None,
-                 security_identity=None):
+                 security_identity=None, security_enabled=None,
+                 vanet_partition=None, random_seed=SIMULATION_SEED):
         self.name = name
         self.port = port
         self.rsu_port = rsu_port
@@ -77,27 +96,35 @@ class Device:
         self.budget_exhausted = False
         self.security_authority = security_authority
         self.signer = security_identity
+        self.security_enabled = (
+            SECURITY_ENABLED if security_enabled is None else security_enabled)
+        effective_seed = (
+            SIMULATION_SEED if random_seed is None else int(random_seed))
+        self.random_seed = effective_seed
 
-        if SECURITY_ENABLED and self.signer is None and self.security_authority is not None:
+        if self.security_enabled and self.signer is None and self.security_authority is not None:
             with Timer(self.name, 0, "key_generation"):
                 self.signer = self.security_authority.register(self.name)
 
         # ---- Model Selection ----
-        torch.manual_seed(42)  # Deterministic proxy init across all devices
+        base_seed = effective_seed - int(device_id)
+        torch.manual_seed(base_seed)  # Common proxy initialization per run
         if self.dataset_type == "mnist":
             self.proxy_model = MNISTProxyModel().to(DEVICE)
-            torch.seed()  # Random seed for private model heterogeneity
+            torch.manual_seed(effective_seed + 1)
             priv_cls = private_model_class or MNISTPrivateModel
             self.private_model = priv_cls().to(DEVICE)
+            self.proxy_class_weights = None
             self.criterion = torch.nn.CrossEntropyLoss()
         else:
             self.proxy_model = ProxyModel().to(DEVICE)
-            torch.seed()
+            torch.manual_seed(effective_seed + 1)
             priv_cls = private_model_class or VanetIDS
             self.private_model = priv_cls().to(DEVICE)
             weights = torch.tensor(
                 [1.0, 2.0, 2.0, 2.0, 2.0, 2.0], dtype=torch.float32
             ).to(DEVICE)
+            self.proxy_class_weights = weights
             self.criterion = torch.nn.CrossEntropyLoss(weight=weights)
 
         priv_params = sum(p.numel() for p in self.private_model.parameters())
@@ -149,32 +176,37 @@ class Device:
             test_indices = subset_indices[-n_test:]
 
             self.dataset = torch.utils.data.Subset(full_mnist, train_indices)
+            train_generator = torch.Generator().manual_seed(effective_seed)
             self.dataloader = DataLoader(
-                self.dataset, batch_size=BATCH_SIZE, shuffle=True)
+                self.dataset, batch_size=BATCH_SIZE, shuffle=True,
+                generator=train_generator)
             self.test_dataset = torch.utils.data.Subset(
                 full_mnist, test_indices)
             self.test_loader = DataLoader(
                 self.test_dataset, batch_size=BATCH_SIZE, shuffle=False)
         else:
-            df = pd.read_csv('Main_data_shuffled.csv')
-            subset_size = len(df) // total_vehicles
-            start_idx = device_id * subset_size
-            end_idx = (len(df) if device_id == total_vehicles - 1
-                       else (device_id + 1) * subset_size)
-            device_df = df.iloc[start_idx:end_idx].copy()
-
-            scaler = get_vanet_scaler()
-            device_df[VANETDataset.FEATURE_COLS] = scaler.transform(
-                device_df[VANETDataset.FEATURE_COLS])
-
-            # 80/20 train/test split for local evaluation
-            n_test = max(1, int(len(device_df) * 0.2))
-            train_df = device_df.iloc[:-n_test]
-            test_df = device_df.iloc[-n_test:]
+            if vanet_partition is not None:
+                train_df, test_df = (
+                    vanet_partition[0].copy(), vanet_partition[1].copy())
+            else:
+                df = pd.read_csv('Main_data_shuffled.csv')
+                subset_size = len(df) // total_vehicles
+                start_idx = device_id * subset_size
+                end_idx = (len(df) if device_id == total_vehicles - 1
+                           else (device_id + 1) * subset_size)
+                device_df = df.iloc[start_idx:end_idx].copy()
+                scaler = get_vanet_scaler()
+                device_df[VANETDataset.FEATURE_COLS] = scaler.transform(
+                    device_df[VANETDataset.FEATURE_COLS])
+                n_test = max(1, int(len(device_df) * 0.2))
+                train_df = device_df.iloc[:-n_test]
+                test_df = device_df.iloc[-n_test:]
 
             self.dataset = VANETDataset(train_df)
+            train_generator = torch.Generator().manual_seed(effective_seed)
             self.dataloader = DataLoader(
-                self.dataset, batch_size=BATCH_SIZE, shuffle=True)
+                self.dataset, batch_size=BATCH_SIZE, shuffle=True,
+                generator=train_generator)
             self.test_dataset = VANETDataset(test_df)
             self.test_loader = DataLoader(
                 self.test_dataset, batch_size=BATCH_SIZE, shuffle=False)
@@ -192,9 +224,10 @@ class Device:
         # Pre-compile vectorized per-sample gradient function
         def single_sample_loss(p, b, x, y, soft):
             out = torch.func.functional_call(self.proxy_model, (p, b), x.unsqueeze(0))
-            ce = F.cross_entropy(out, y.unsqueeze(0))
-            kl = dml_loss(out, soft.unsqueeze(0), DML_TEMPERATURE)
-            return (1 - DML_BETA) * ce + DML_BETA * kl
+            return proxy_training_objective(
+                out, y.unsqueeze(0), soft.unsqueeze(0),
+                self.proxy_class_weights,
+            )
 
         grad_fn = torch.func.grad(single_sample_loss)
         self.vmap_grad_fn = torch.func.vmap(grad_fn, in_dims=(None, None, 0, 0, 0))
@@ -205,40 +238,102 @@ class Device:
         self._peer_lock = threading.Lock()
         self._peer_buffers = {}  # round → {peer_name: weights}
         self._request_sent_at = {}  # round → perf_counter when LOCAL_UPDATE sent
+        self._pending_global_updates = {}
+        self._round_phase = ROUND_IDLE
         self.receiver = Receiver(self.port, self.on_receive, node_name=self.name)
 
     # ------------------------------------------------------------------
     # Message handling (Device -> RSU -> Server hierarchy + V2V)
     # ------------------------------------------------------------------
+    def _decode_rsu_global(self, msg):
+        """Authenticate and decode an assigned-RSU global update."""
+        if (msg.get("sender") != self.rsu_name
+                or msg.get("recipient") != self.name):
+            return None
+        if self.security_enabled:
+            if self.security_authority is None or self.signer is None:
+                return None
+            round_num = msg.get("round", 0)
+            with Timer(self.name, round_num, "decryption"):
+                result = decrypt_envelope(
+                    self.security_authority, self.signer, msg,
+                    "GLOBAL_UPDATE")
+            if result is None:
+                return None
+            payload, sender_info, signature = result
+            verifier = CertificatelessVerifier(
+                self.security_authority.P_pub)
+            with Timer(self.name, round_num, "signature_verification"):
+                if not verifier.verify(payload, signature, sender_info):
+                    return None
+        else:
+            payload = msg.get("global_weights")
+            if not isinstance(payload, bytes):
+                return None
+        try:
+            return deserialize_weights(payload)
+        except Exception:
+            return None
+
+    def _handle_verified_global(self, round_num, weights):
+        """Apply a verified global only after this round's local work is done."""
+        if round_num != self.current_round:
+            return
+        applied = False
+        with self.proxy_lock:
+            if self._round_phase == ROUND_WAITING_GLOBAL:
+                self.proxy_model.load_state_dict(weights)
+                applied = True
+            elif self._round_phase in {ROUND_TRAINING, ROUND_REPORTING}:
+                self._pending_global_updates[round_num] = weights
+        if applied:
+            self.round_event.set()
+
+    def _apply_pending_global(self, round_num):
+        """Apply a queued verified global when the reporting barrier is reached."""
+        with self.proxy_lock:
+            weights = self._pending_global_updates.pop(round_num, None)
+            if weights is None:
+                return False
+            self.proxy_model.load_state_dict(weights)
+        self.round_event.set()
+        return True
+
     def on_receive(self, msg):
         msg_type = msg.get("type") if isinstance(msg, dict) else None
         if msg_type == "GLOBAL_UPDATE":
             msg_round = msg.get("round", None)
-            # Accept global update if matching the current round or if unnumbered
-            if msg_round is None or msg_round == self.current_round:
-                # Action-to-response latency: LOCAL_UPDATE send → GLOBAL_UPDATE receive
-                if isinstance(msg_round, int) and msg_round in self._request_sent_at:
+            if isinstance(msg_round, int) and msg_round == self.current_round:
+                weights = self._decode_rsu_global(msg)
+                if weights is None:
+                    print(f"[{self.name}] [SECURITY] Dropped invalid GLOBAL_UPDATE")
+                    return
+                if msg_round in self._request_sent_at:
                     metrics_tracker.record_duration(
                         self.name, msg_round, "action_to_response",
                         time.perf_counter() - self._request_sent_at.pop(msg_round),
                     )
-                raw = msg.get("global_weights")
-                if isinstance(raw, bytes):
-                    weights = deserialize_weights(raw)
-                else:
-                    weights = raw
-                if weights is not None:
-                    with self.proxy_lock:
-                        self.proxy_model.load_state_dict(weights)
-                self.round_event.set()
+                self._handle_verified_global(msg_round, weights)
 
         elif msg_type == "PEER_UPDATE":
             r = msg.get("round")
             sender = msg.get("sender")
-            if not isinstance(r, int) or not sender or sender == self.name:
+            peer_directory = getattr(self, "peer_directory", {})
+            if (not isinstance(r, int) or r != self.current_round
+                    or not sender or sender == self.name
+                    or sender not in peer_directory):
+                return
+            topology = getattr(self, "topology", None)
+            if (topology is None or sender not in topology.get_v2v_neighbors(
+                    self.name, list(peer_directory))):
                 return
             weights = None
-            if SECURITY_ENABLED and self.security_authority is not None and self.signer is not None and "sig" in msg:
+            if self.security_enabled:
+                if (self.security_authority is None or self.signer is None
+                        or "sig" not in msg):
+                    print(f"[{self.name}] [SECURITY] Dropped unsigned PEER_UPDATE "
+                          f"from {sender}")
+                    return
                 result = verify_envelope(
                     self.security_authority, self.signer, msg, "PEER_UPDATE")
                 if result is None:
@@ -256,8 +351,6 @@ class Device:
                         weights = deserialize_weights(raw)
                     except Exception:
                         return
-                elif isinstance(raw, dict):
-                    weights = raw
             if weights is None:
                 return
             with self._peer_lock:
@@ -312,11 +405,10 @@ class Device:
                         else:
                             # Non-DP batch baseline
                             proxy_out = self.proxy_model(data)
-                            proxy_ce = self.criterion(proxy_out, target)
-                            proxy_kl = dml_loss(
-                                proxy_out, private_soft, DML_TEMPERATURE)
-                            proxy_total = ((1 - DML_BETA) * proxy_ce
-                                           + DML_BETA * proxy_kl)
+                            proxy_total = proxy_training_objective(
+                                proxy_out, target, private_soft,
+                                self.proxy_class_weights,
+                            )
                             self.proxy_optimizer.zero_grad()
                             proxy_total.backward()
                             self.proxy_optimizer.step()
@@ -411,15 +503,12 @@ class Device:
         if not neighbors:
             return local_weights
 
-        with self._peer_lock:
-            self._peer_buffers.pop(round_num, None)
-
         # Send PEER_UPDATE to each in-range neighbor
         for peer in neighbors:
             peer_port = self.peer_directory.get(peer)
             if peer_port is None:
                 continue
-            if SECURITY_ENABLED and self.signer is not None and self.security_authority is not None:
+            if self.security_enabled and self.signer is not None and self.security_authority is not None:
                 raw_payload = serialize_weights(local_weights)
                 sig = self.signer.sign(raw_payload)
                 aad = message_aad("PEER_UPDATE", self.name, peer, round_num)
@@ -436,10 +525,13 @@ class Device:
                     "sender": self.name,
                     "recipient": peer,
                     "round": round_num,
-                    "weights": local_weights,
+                    "weights": serialize_weights(local_weights),
                 }
             send_msg(("127.0.0.1", peer_port), msg,
-                     sender_name=self.name, round_num=round_num)
+                     sender_name=self.name, round_num=round_num,
+                     wireless_link=WirelessLink(
+                         "v2v", self.topology.get_v2v_distance(
+                             self.name, peer)))
 
         # Collect neighbor proxies for a short window
         deadline = time.time() + V2V_COLLECT_TIMEOUT
@@ -458,11 +550,59 @@ class Device:
                   f"(neighbors={neighbors})")
             return local_weights
 
+        # Equation (6): equal weights b=1/(|received|+1) for own and each
+        # neighbour proxy make this explicit weighted aggregation an average.
         pooled = [local_weights] + list(received.values())
         averaged = average_weights(pooled)
         print(f"[{self.name}] V2V: averaged local + {len(received)} peer "
               f"proxies (neighbors in range: {neighbors})")
         return averaged
+
+    def _build_no_update_message(self, round_num):
+        """Build an authenticated control-plane report with no model payload."""
+        if (self.security_enabled and self.signer is not None
+                and self.security_authority is not None):
+            payload = b""
+            with Timer(self.name, round_num, "signature_generation"):
+                signature = self.signer.sign(payload)
+            with Timer(self.name, round_num, "encryption"):
+                aad = message_aad(
+                    "NO_UPDATE", self.name, self.rsu_name, round_num)
+                rsu_info = self.security_authority.public_info(self.rsu_name)
+                shared_secret = self.signer.shared_secret_for(rsu_info)
+                ciphertext, nonce, tag = encrypt_payload(
+                    shared_secret, payload, aad)
+            return build_envelope(
+                "NO_UPDATE", self.signer, self.rsu_name, round_num,
+                signature, ciphertext, nonce, tag,
+            )
+        return {
+            "type": "NO_UPDATE",
+            "sender": self.name,
+            "recipient": self.rsu_name,
+            "round": round_num,
+        }
+
+    def _send_no_update(self, round_num):
+        """Notify the RSU barrier without sending model parameters."""
+        return send_msg(
+            ("127.0.0.1", self.rsu_port),
+            self._build_no_update_message(round_num),
+            sender_name=self.name,
+            round_num=round_num,
+            wireless_link=WirelessLink(
+                "v2rsu", self.topology.get_distance_to_rsu(
+                    self.name, self.rsu_name)),
+        )
+
+    def _warn_if_privacy_high(self, epsilon):
+        """Report a weak privacy regime without changing the configured policy."""
+        if epsilon > DP_EPSILON_WARNING_THRESHOLD:
+            print(
+                f"[{self.name}] [PRIVACY WARNING] eps={epsilon:.2f} exceeds "
+                f"the reporting threshold {DP_EPSILON_WARNING_THRESHOLD:.2f}; "
+                "training parameters are unchanged."
+            )
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -473,8 +613,13 @@ class Device:
           try:
             self.current_round = r
             self.round_event.clear()
+            with self.proxy_lock:
+                self._round_phase = ROUND_TRAINING
+                self._pending_global_updates.pop(r, None)
+            with self._peer_lock:
+                self._peer_buffers[r] = {}
 
-            if self.name.endswith("D1"):
+            if self.name.endswith("_V1"):
                 print(f"\n[{'=' * 15} ROUND {r} {'=' * 15}]")
 
             # 1. Train with DML
@@ -511,6 +656,7 @@ class Device:
                     r, self.name, eps, self.privacy_accountant.delta)
                 print(f"    -> [PRIVACY] eps = {eps:.4f}, "
                       f"delta = {self.privacy_accountant.delta:.1e}")
+                self._warn_if_privacy_high(eps)
 
                 # Budget drop-out check
                 if (DP_MAX_EPSILON is not None
@@ -526,7 +672,16 @@ class Device:
             if not self.budget_exhausted:
                 self.proxy_scheduler.step()
 
+            if V2V_ENABLED:
+                peers = list(self.peer_directory)
+                ready_neighbors = self.topology.get_v2v_neighbors(
+                    self.name, peers)
+                self.topology.mark_v2v_ready(self.name, r)
+                self.topology.wait_for_v2v_ready(
+                    self.name, r, ready_neighbors, V2V_READY_TIMEOUT)
+
             # 5. Check V2RSU range -> send proxy to RSU & wait for global round sync
+            self._round_phase = ROUND_REPORTING
             dist = self.topology.get_distance_to_rsu(
                 self.name, self.rsu_name)
             can_reach = self.topology.can_reach_rsu(
@@ -541,7 +696,7 @@ class Device:
                 # Eq. 6 — V2V neighbor gossip before hierarchical upload
                 proxy_weights = self._v2v_share_and_aggregate(r, proxy_weights)
 
-                if SECURITY_ENABLED and self.signer is not None and self.security_authority is not None:
+                if self.security_enabled and self.signer is not None and self.security_authority is not None:
                     raw_payload = serialize_weights(proxy_weights)
                     with Timer(self.name, r, "signature_generation"):
                         sig = self.signer.sign(raw_payload)
@@ -559,26 +714,51 @@ class Device:
                         "type": "LOCAL_UPDATE",
                         "sender": self.name,
                         "round": r,
-                        "weights": proxy_weights,
+                        "weights": serialize_weights(proxy_weights),
                     }
                 send_started = time.perf_counter()
-                send_msg(("127.0.0.1", self.rsu_port), msg, sender_name=self.name, round_num=r)
-                self._request_sent_at[r] = send_started
+                sent = send_msg(
+                    ("127.0.0.1", self.rsu_port), msg,
+                    sender_name=self.name, round_num=r,
+                    wireless_link=WirelessLink("v2rsu", dist),
+                )
+                if sent:
+                    self._request_sent_at[r] = send_started
 
                 # Wait for global update for this round
-                received = self.round_event.wait(timeout=TIMEOUT)
+                self._round_phase = ROUND_WAITING_GLOBAL
+                received = (
+                    self._apply_pending_global(r)
+                    or self.round_event.wait(timeout=TIMEOUT)
+                )
                 if not received:
                     self._request_sent_at.pop(r, None)
                     print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
             elif self.budget_exhausted and can_reach:
-                print(f"[{self.name}] In range but privacy budget exhausted. Waiting for global update...")
-                received = self.round_event.wait(timeout=TIMEOUT)
+                print(f"[{self.name}] In range but privacy budget exhausted. "
+                      "Reporting NO_UPDATE and waiting for global update...")
+                send_started = time.perf_counter()
+                if self._send_no_update(r):
+                    self._request_sent_at[r] = send_started
+                self._round_phase = ROUND_WAITING_GLOBAL
+                received = (
+                    self._apply_pending_global(r)
+                    or self.round_event.wait(timeout=TIMEOUT)
+                )
                 if not received:
                     print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
             else:
                 print(f"[{self.name}] [X] OUT OF RANGE ({dist:.0f}m > {V2RSU_RANGE}m). Synchronizing on round barrier...")
-                # Wait for round broadcast so out-of-range vehicles do not race ahead
-                received = self.round_event.wait(timeout=TIMEOUT)
+                # NO_UPDATE is synchronization metadata only; no proxy parameters
+                # are transmitted by an out-of-range vehicle.
+                send_started = time.perf_counter()
+                if self._send_no_update(r):
+                    self._request_sent_at[r] = send_started
+                self._round_phase = ROUND_WAITING_GLOBAL
+                received = (
+                    self._apply_pending_global(r)
+                    or self.round_event.wait(timeout=TIMEOUT)
+                )
                 if not received:
                     print(f"[{self.name}] [!] Timed out waiting for round {r} synchronization")
 
@@ -593,6 +773,13 @@ class Device:
             import traceback
             traceback.print_exc()
           finally:
+            with self._peer_lock:
+                self._peer_buffers.pop(r, None)
+            self.topology.clear_v2v_ready(self.name, r)
+            with self.proxy_lock:
+                self._round_phase = ROUND_IDLE
+                self._pending_global_updates.pop(r, None)
+            self._request_sent_at.pop(r, None)
             metrics_tracker.record_duration(
                 self.name, r, "device_round_execution", time.perf_counter() - round_t0
             )

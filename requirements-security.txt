@@ -1,3 +1,4 @@
-# Elliptic-curve ops: MIRACL Core Python (miracl_python/nist256 from core-master/python).
-# AES-256-GCM: PyCryptodome (MIRACL Python has no GCM module).
-pycryptodome>=3.20
+# MIRACL Core provides NIST256 point arithmetic.  The optional native bridge
+# provides SHA-256/AES-GCM; cryptography is the portable fallback when the
+# platform-specific bridge has not been built.
+cryptography>=42.0.0

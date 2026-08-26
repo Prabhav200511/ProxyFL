@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import unittest
+import os
+import tempfile
+
+import pandas as pd
 from metrics import MetricsTracker, energy_joules
 from config import OBU_PEAK_POWER_W, X_OP_CRYPTO, X_OP_COMM, X_OP_TRAIN, X_OP_IDLE
 
@@ -18,7 +22,7 @@ class MetricsAndEnergyTests(unittest.TestCase):
         self.assertAlmostEqual(e_crypto, expected)
 
     def test_energy_and_latency_decomposition(self) -> None:
-        node = "C1_D1"
+        node = "C1_V1"
         r = 1
 
         # Simulate durations
@@ -53,6 +57,19 @@ class MetricsAndEnergyTests(unittest.TestCase):
 
         # Verify idle duration: execution (700) - active (500 + 24 + 25) = 151ms
         self.assertAlmostEqual(row["idle_latency_ms"], 151.0)
+
+    def test_export_includes_vanet_capacity_columns(self) -> None:
+        self.tracker.record_wireless_delivery(
+            "C0_V1", 1, 1000, 8_000_000.0)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "metrics.csv")
+            self.tracker.export_csv(path)
+            frame = pd.read_csv(path)
+        required = {
+            "vanet_wireless_bits", "vanet_airtime_s",
+            "vanet_link_capacity_bps", "vanet_goodput_bps",
+        }
+        self.assertTrue(required.issubset(frame.columns))
 
 
 if __name__ == "__main__":

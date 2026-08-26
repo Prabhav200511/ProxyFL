@@ -1,14 +1,16 @@
 # network.py — TCP message passing for the ProxyFL VANET simulation
 import socket
-import pickle
 import struct
 import threading
 import time
+from config import MAX_NETWORK_MESSAGE_BYTES
 from metrics import metrics_tracker
+from wire_codec import decode_message, encode_message
+from vanet_channel import WirelessLink, link_capacity_bps
 
 
-def send_msg(addr, msg, sender_name=None, round_num=None):
-    """Send a pickled message to (host, port) with a 4-byte length prefix.
+def send_msg(addr, msg, sender_name=None, round_num=None, wireless_link=None):
+    """Send a safely encoded message with a 4-byte length prefix.
 
     Measures TX bytes and communication latency when sender/round are available.
     Returns True on success, False on failure (logged to stderr).
@@ -18,7 +20,7 @@ def send_msg(addr, msg, sender_name=None, round_num=None):
 
     t0 = time.perf_counter()
     try:
-        data = pickle.dumps(msg)
+        data = encode_message(msg)
         n_bytes = len(data)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(10)
@@ -26,8 +28,21 @@ def send_msg(addr, msg, sender_name=None, round_num=None):
             s.sendall(struct.pack('>I', n_bytes) + data)
         duration = time.perf_counter() - t0
         if sender and r is not None and isinstance(r, int) and r >= 0:
-            metrics_tracker.record_bytes(sender, r, "tx", n_bytes + 4)
-            metrics_tracker.record_duration(sender, r, "communication_tx", duration)
+            try:
+                metrics_tracker.record_bytes(sender, r, "tx", n_bytes + 4)
+                metrics_tracker.record_duration(
+                    sender, r, "communication_tx", duration)
+                if wireless_link is not None:
+                    if not isinstance(wireless_link, WirelessLink):
+                        raise TypeError(
+                            "wireless_link must be a WirelessLink")
+                    metrics_tracker.record_wireless_delivery(
+                        sender, r, n_bytes + 4,
+                        link_capacity_bps(wireless_link.distance_m),
+                    )
+            except Exception as measurement_error:
+                print(f"[NET] Measurement failed after delivery: "
+                      f"{measurement_error}")
         return True
     except ConnectionRefusedError:
         print(f"[NET] Connection refused to {addr[1]} "
@@ -43,10 +58,12 @@ class Receiver:
     to a callback function.
     """
 
-    def __init__(self, port, callback, node_name=None):
+    def __init__(self, port, callback, node_name=None,
+                 max_message_bytes=MAX_NETWORK_MESSAGE_BYTES):
         self.port = port
         self.callback = callback
         self.node_name = node_name
+        self.max_message_bytes = max_message_bytes
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind(("127.0.0.1", self.port))
@@ -78,10 +95,12 @@ class Receiver:
             if not raw_msglen:
                 return
             msglen = struct.unpack('>I', raw_msglen)[0]
+            if msglen <= 0 or msglen > self.max_message_bytes:
+                raise ValueError(f"invalid frame length: {msglen}")
             data = self._recvall(conn, msglen)
             duration = time.perf_counter() - t0
             if data:
-                msg = pickle.loads(data)
+                msg = decode_message(data)
                 if self.node_name and isinstance(msg, dict):
                     r = msg.get("round")
                     if isinstance(r, int) and r >= 0:
@@ -100,4 +119,4 @@ class Receiver:
             if not packet:
                 return None
             data.extend(packet)
-        return data
+        return data

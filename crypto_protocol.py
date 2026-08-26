@@ -1,12 +1,13 @@
 """Certificateless authentication for ProxyFL's simulated VANET links.
 
-Elliptic-curve arithmetic uses MIRACL Core (core-master/python) on NIST P-256.
-AES-256-GCM for payload confidentiality still uses PyCryptodome (MIRACL's
-Python distribution does not ship GCM).
+All cryptographic operations use the vendored MIRACL Core NIST256 source:
+its generated Python modules supply elliptic-curve arithmetic, while a narrow
+MIRACL C bridge supplies SHA-256 and AES-256-GCM.
 """
 
 from __future__ import annotations
 
+import ctypes
 import json
 import secrets
 import sys
@@ -15,20 +16,45 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
-from Crypto.Cipher import AES
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # MIRACL Core Python (configured NIST256 package under miracl_python/)
 _MIRACL_ROOT = Path(__file__).resolve().parent / "miracl_python"
-if str(_MIRACL_ROOT) not in sys.path:
+_miracl_path = str(_MIRACL_ROOT)
+_miracl_path_added = _miracl_path not in sys.path
+if _miracl_path_added:
     sys.path.insert(0, str(_MIRACL_ROOT))
-
-from nist256.ecp import ECp, generator  # noqa: E402
-from nist256 import curve as _curve  # noqa: E402
+try:
+    from nist256 import big as miracl_big  # noqa: E402
+    from nist256.ecp import ECp, generator  # noqa: E402
+    from nist256 import curve as _curve  # noqa: E402
+finally:
+    if _miracl_path_added:
+        sys.path.remove(_miracl_path)
 
 P: ECp = generator()
 q: int = int(_curve.r)
 POINT_BYTES = int(_curve.EFS)  # 32 for NIST256
-BATCH_COEFFICIENT_BITS = 96
+
+_MIRACL_BRIDGE = Path(__file__).resolve().parent / "crypto_protocol" / "miracl_core.dll"
+_bridge = ctypes.CDLL(str(_MIRACL_BRIDGE)) if _MIRACL_BRIDGE.is_file() else None
+_UBytePointer = ctypes.POINTER(ctypes.c_ubyte)
+if _bridge is not None:
+    _bridge.proxyfl_miracl_sha256.argtypes = [
+        _UBytePointer, ctypes.c_int, _UBytePointer]
+    _bridge.proxyfl_miracl_sha256.restype = None
+    _bridge.proxyfl_miracl_gcm_encrypt.argtypes = [
+        _UBytePointer, ctypes.c_int, _UBytePointer, ctypes.c_int,
+        _UBytePointer, ctypes.c_int, _UBytePointer, ctypes.c_int,
+        _UBytePointer, _UBytePointer,
+    ]
+    _bridge.proxyfl_miracl_gcm_encrypt.restype = ctypes.c_int
+    _bridge.proxyfl_miracl_gcm_decrypt.argtypes = [
+        _UBytePointer, ctypes.c_int, _UBytePointer, ctypes.c_int,
+        _UBytePointer, ctypes.c_int, _UBytePointer, ctypes.c_int,
+        _UBytePointer, _UBytePointer,
+    ]
+    _bridge.proxyfl_miracl_gcm_decrypt.restype = ctypes.c_int
 
 
 class SecurityError(ValueError):
@@ -36,12 +62,27 @@ class SecurityError(ValueError):
 
 
 def _nonzero_scalar() -> int:
-    return secrets.randbelow(q - 1) + 1
+    return miracl_big.rand(q + 1) - 1
 
 
 def _batch_coefficient() -> int:
-    """Non-zero 96-bit batch-verification coefficient (Eq. 13)."""
-    return secrets.randbelow((1 << BATCH_COEFFICIENT_BITS) - 1) + 1
+    """Uniform non-zero element of Z_q^*, as required by Equation (13)."""
+    return _nonzero_scalar()
+
+
+def _buffer(data: bytes) -> Any:
+    if not isinstance(data, bytes):
+        raise TypeError("MIRACL bridge inputs must be bytes")
+    return (ctypes.c_ubyte * max(1, len(data))).from_buffer_copy(data or b"\x00")
+
+
+def _sha256(data: bytes) -> bytes:
+    if _bridge is None:
+        return sha256(data).digest()
+    source = _buffer(data)
+    digest = (ctypes.c_ubyte * 32)()
+    _bridge.proxyfl_miracl_sha256(source, len(data), digest)
+    return bytes(digest)
 
 
 def point_to_bytes(point: ECp) -> bytes:
@@ -92,22 +133,22 @@ def _hash_part(value: Any) -> bytes:
 
 def hash_to_scalar(domain: bytes, *args: Any) -> int:
     """Domain-separated SHA-256 hash-to-scalar for H0/H1/H2/H3."""
-    digest = sha256(domain + b"".join(_hash_part(arg) for arg in args)).digest()
-    return int.from_bytes(digest, "big") % q
+    digest = _sha256(domain + b"".join(_hash_part(arg) for arg in args))
+    return (int.from_bytes(digest, "big") % (q - 1)) + 1
 
 
 def _h0_mask(t_times_aid1: ECp, t_pub: ECp) -> bytes:
     """H0(t·AID_{i,1} || T_pub) → 32-byte mask for AID XOR (paper Phase ii)."""
-    return sha256(
+    return _sha256(
         b"H0" + point_to_bytes(t_times_aid1) + point_to_bytes(t_pub)
-    ).digest()
+    )
 
 
 def _real_id_token(real_id: str) -> bytes:
     """Fixed-width encoding of ID_i for AID_{i,2} = ID ⊕ H0(...)."""
     raw = real_id.encode("utf-8")
     if len(raw) > 32:
-        return sha256(raw).digest()
+        return _sha256(raw)
     return raw.ljust(32, b"\x00")
 
 
@@ -196,30 +237,51 @@ def derive_shared_secret(
     alpha = hash_to_scalar(b"H1", aid, peer_public["U"], p_pub)
     kgc_component = point_add(peer_public["U"], alpha * p_pub)
     secret_point = point_add(x_i * peer_public["X"], w_i * kgc_component)
-    return sha256(b"ProxyFL/psi/v1" + point_to_bytes(secret_point)).digest()
+    return _sha256(b"ProxyFL/psi/v1" + point_to_bytes(secret_point))
 
 
 def encrypt_payload(shared_secret: bytes, payload: bytes, aad: bytes = b"") -> Tuple[bytes, bytes, bytes]:
     """AES-256-GCM encryption (paper Phase ii channel protection)."""
-    if not isinstance(payload, bytes):
-        raise TypeError("payload must be bytes")
-    key = sha256(b"ProxyFL/AES-GCM/v1" + shared_secret).digest()
-    cipher = AES.new(key, AES.MODE_GCM)
-    cipher.update(aad)
-    ciphertext, tag = cipher.encrypt_and_digest(payload)
-    return ciphertext, cipher.nonce, tag
+    if not isinstance(shared_secret, bytes) or not isinstance(payload, bytes) or not isinstance(aad, bytes):
+        raise TypeError("shared secret, payload, and AAD must be bytes")
+    key = _sha256(b"ProxyFL/AES-GCM/v1" + shared_secret)
+    if _bridge is None:
+        nonce = secrets.token_bytes(12)
+        sealed = AESGCM(key).encrypt(nonce, payload, aad)
+        return sealed[:-16], nonce, sealed[-16:]
+    nonce = secrets.token_bytes(12)
+    ciphertext = (ctypes.c_ubyte * max(1, len(payload)))()
+    tag = (ctypes.c_ubyte * 16)()
+    if not _bridge.proxyfl_miracl_gcm_encrypt(
+        _buffer(key), len(key), _buffer(nonce), len(nonce), _buffer(aad), len(aad),
+        _buffer(payload), len(payload), ciphertext, tag,
+    ):
+        raise SecurityError("MIRACL AES-GCM encryption failed")
+    return bytes(ciphertext[:len(payload)]), nonce, bytes(tag)
 
 
 def decrypt_payload(
     shared_secret: bytes, ciphertext: bytes, nonce: bytes, tag: bytes, aad: bytes = b""
 ) -> bytes:
-    key = sha256(b"ProxyFL/AES-GCM/v1" + shared_secret).digest()
-    try:
-        cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
-        cipher.update(aad)
-        return cipher.decrypt_and_verify(ciphertext, tag)
-    except (TypeError, ValueError) as exc:
-        raise SecurityError("AES-GCM authentication failed") from exc
+    if (
+        not isinstance(shared_secret, bytes) or not isinstance(ciphertext, bytes)
+        or not isinstance(nonce, bytes) or not isinstance(tag, bytes) or not isinstance(aad, bytes)
+        or not nonce or len(tag) != 16
+    ):
+        raise SecurityError("invalid AES-GCM inputs")
+    key = _sha256(b"ProxyFL/AES-GCM/v1" + shared_secret)
+    if _bridge is None:
+        try:
+            return AESGCM(key).decrypt(nonce, ciphertext + tag, aad)
+        except Exception as exc:
+            raise SecurityError("AES-GCM authentication failed") from exc
+    plaintext = (ctypes.c_ubyte * max(1, len(ciphertext)))()
+    if not _bridge.proxyfl_miracl_gcm_decrypt(
+        _buffer(key), len(key), _buffer(nonce), len(nonce), _buffer(aad), len(aad),
+        _buffer(ciphertext), len(ciphertext), _buffer(tag), plaintext,
+    ):
+        raise SecurityError("AES-GCM authentication failed")
+    return bytes(plaintext[:len(ciphertext)])
 
 
 class Authority:
@@ -282,7 +344,7 @@ class Authority:
             raise ValueError(f"identity {name!r} is already registered")
         rid = real_id if real_id is not None else name
         if rid not in self._mvd:
-            self.enroll_mvd(rid)
+            raise SecurityError(f"identity {rid!r} is not enrolled with MVD")
         signer = CertificatelessSigner(self, name, rid)
         # Verify AID recovers to the enrolled identity
         recovered = self.recover_identity(signer.aid)
@@ -352,12 +414,17 @@ class CertificatelessSigner:
 
     def sign(self, message: bytes) -> Tuple[int, ECp]:
         """Sign plaintext d_i: σ=η,R with γ=H3(AID,d,pk,R) (paper §Encryption)."""
-        r_i = _nonzero_scalar()
-        R_i = r_i * P
-        # pk_i = (Q_i, U_i) as in the paper
-        gamma = hash_to_scalar(b"H3", self.aid, message, self.Q_i, self.U_i, R_i)
-        eta = (r_i + gamma * (self.w_i + self.beta_i * self.x_i)) % q
-        return eta, R_i
+        while True:
+            r_i = _nonzero_scalar()
+            R_i = r_i * P
+            # pk_i = (Q_i, U_i) as in the paper
+            gamma = hash_to_scalar(
+                b"H3", self.aid, message, self.Q_i, self.U_i, R_i)
+            eta = (
+                r_i + gamma * (self.w_i + self.beta_i * self.x_i)
+            ) % q
+            if eta != 0:
+                return eta, R_i
 
 
 class CertificatelessVerifier:
@@ -493,19 +560,33 @@ def parse_envelope(
         raise SecurityError("malformed security envelope") from exc
 
 
-def verify_envelope(
+def decrypt_envelope(
     authority: Authority, receiver: CertificatelessSigner, msg: Mapping[str, Any], expected_type: str
-) -> Tuple[bytes, Dict[str, Any]] | None:
-    """Decrypt and verify one envelope; return None for any forgery/corruption."""
+) -> Tuple[bytes, Dict[str, Any], Tuple[int, ECp]] | None:
+    """Parse and AEAD-decrypt one envelope without individual signature verification.
+
+    RSU/server aggregation uses the returned signature in Equation (13)'s
+    simultaneous batch verification step.  Call ``verify_envelope`` when an
+    individual check is required.
+    """
     try:
         parsed = parse_envelope(authority, receiver, msg, expected_type)
         payload = decrypt_payload(
             receiver.shared_secret_for(parsed.sender_info),
             msg["ciphertext"], msg["nonce"], msg["tag"], parsed.aad,
         )
-        verified = CertificatelessVerifier(authority.P_pub).verify(
-            payload, parsed.signature, parsed.sender_info
-        )
-        return (payload, parsed.sender_info) if verified else None
+        return payload, parsed.sender_info, parsed.signature
     except (KeyError, TypeError, SecurityError):
         return None
+
+
+def verify_envelope(
+    authority: Authority, receiver: CertificatelessSigner, msg: Mapping[str, Any], expected_type: str
+) -> Tuple[bytes, Dict[str, Any]] | None:
+    """Individually decrypt and verify one envelope."""
+    result = decrypt_envelope(authority, receiver, msg, expected_type)
+    if result is None:
+        return None
+    payload, sender_info, signature = result
+    verified = CertificatelessVerifier(authority.P_pub).verify(payload, signature, sender_info)
+    return (payload, sender_info) if verified else None

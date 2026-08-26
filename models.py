@@ -277,11 +277,15 @@ def model_l2_deviation(weights_a, weights_b):
     return torch.norm(a_flat - b_flat, p=2).item()
 
 
-def filter_trusted_weights(weight_entries, threshold=None, median_multiplier=3.0):
+def filter_trusted_weights(
+        weight_entries, reference_weights=None, threshold=None,
+        median_multiplier=3.0):
     """Trust-score filter (Eq. 9–10).
 
     Args:
         weight_entries: list of (sender_name, state_dict)
+        reference_weights: previous authenticated global state; when omitted,
+            retain the legacy same-batch mean fallback
         threshold: absolute L2 cutoff; if None use median(dev)×multiplier
         median_multiplier: used when threshold is None
 
@@ -293,7 +297,11 @@ def filter_trusted_weights(weight_entries, threshold=None, median_multiplier=3.0
         return [], []
 
     weights_only = [w for _, w in weight_entries]
-    reference = average_weights(weights_only)
+    reference = (
+        reference_weights
+        if reference_weights is not None
+        else average_weights(weights_only)
+    )
     deviations = [
         (name, model_l2_deviation(reference, w), w)
         for name, w in weight_entries
