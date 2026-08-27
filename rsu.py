@@ -9,7 +9,8 @@ import time
 import threading
 
 from config import (
-    RSU_ROUND_TIMEOUT, SECURITY_ENABLED, BATCH_VERIFICATION_ENABLED,
+    RSU_ROUND_TIMEOUT, RSU_ROUND_MAX_WAIT,
+    SECURITY_ENABLED, BATCH_VERIFICATION_ENABLED,
     TRUST_SCORE_ENABLED, TRUST_L2_THRESHOLD, TRUST_MEDIAN_MULTIPLIER,
 )
 from models import average_weights, filter_trusted_weights
@@ -78,6 +79,7 @@ class RSU:
         self.round_reported = {}
         self.completed_rounds = set()
         self._round_timers = {}
+        self._round_deadlines = {}  # round -> hard cap (perf_counter) for collection
         self._lock = threading.Lock()  # protects round_buffers, completed_rounds, _round_timers
         self.receiver = Receiver(self.port, self.on_receive, node_name=self.name)
 
@@ -187,15 +189,15 @@ class RSU:
                 if r not in self.round_buffers:
                     self.round_buffers[r] = []
                     self.round_reported[r] = set()
-                    timer = threading.Timer(
-                        RSU_ROUND_TIMEOUT, self._force_aggregate, args=[r])
-                    timer.daemon = True
-                    timer.start()
-                    self._round_timers[r] = timer
+                    self._round_deadlines[r] = (
+                        time.perf_counter() + RSU_ROUND_MAX_WAIT)
 
                 if sender in self.round_reported[r]:
                     return
                 self.round_reported[r].add(sender)
+                # Restart the inactivity window: stragglers queued behind
+                # TRAINING_SEMAPHORE must not be silently excluded.
+                self._restart_round_timer_locked(r)
 
                 if msg_type == "LOCAL_UPDATE":
                     entry = {
@@ -226,26 +228,38 @@ class RSU:
                 for key, value in weights.items()
             }
             # Re-authenticate the global proxy separately for each vehicle.
+            # One vehicle's failure must not deprive the rest of the cluster.
             for index, port in enumerate(self.cluster_ports):
                 if index >= len(self.vehicle_names):
                     continue
                 vehicle_name = self.vehicle_names[index]
-                wireless_link = None
-                if self.topology is not None:
-                    distance = self.topology.get_distance_to_rsu(
-                        vehicle_name, self.name)
-                    if distance != float("inf"):
-                        wireless_link = WirelessLink("rsu2v", distance)
-                vehicle_msg = self._build_vehicle_global(
-                    vehicle_name, round_num, weights)
-                send_msg(
-                    ("127.0.0.1", port), vehicle_msg,
-                    sender_name=self.name, round_num=round_num,
-                    wireless_link=wireless_link,
-                )
+                try:
+                    wireless_link = None
+                    if self.topology is not None:
+                        distance = self.topology.get_distance_to_rsu(
+                            vehicle_name, self.name)
+                        if distance != float("inf"):
+                            wireless_link = WirelessLink("rsu2v", distance)
+                    vehicle_msg = self._build_vehicle_global(
+                        vehicle_name, round_num, weights)
+                    send_msg(
+                        ("127.0.0.1", port), vehicle_msg,
+                        sender_name=self.name, round_num=round_num,
+                        wireless_link=wireless_link,
+                    )
+                except Exception as exc:
+                    print(f"[{self.name}] [ERROR] Could not deliver round "
+                          f"{round_num} global to {vehicle_name}: {exc!r}")
 
     def aggregate(self, r):
-        """FedAvg the received proxy weights and forward to the server."""
+        """FedAvg the received proxy weights and forward to the server.
+
+        Once the round is claimed it MUST produce exactly one downstream
+        message.  Aggregation runs inside a receiver thread, so an unhandled
+        exception here used to abort the round silently: the server never
+        learned the cluster had reported and every vehicle in it stalled until
+        its own failsafe timeout.
+        """
         rsu_t0 = time.perf_counter()
         with self._lock:
             if r in self.completed_rounds:
@@ -255,6 +269,27 @@ class RSU:
             data = self.round_buffers.pop(r, [])
             self.round_reported.pop(r, None)
 
+        try:
+            self._aggregate_round(r, data)
+        except Exception as exc:
+            print(f"[{self.name}] [ERROR] Round {r} aggregation failed: "
+                  f"{exc!r}. Reporting NO_CLUSTER_UPDATE so the server round "
+                  "can still close.")
+            import traceback
+            traceback.print_exc()
+            try:
+                self._send_no_cluster_update(r)
+            except Exception as fallback_exc:
+                print(f"[{self.name}] [ERROR] NO_CLUSTER_UPDATE fallback "
+                      f"failed for round {r}: {fallback_exc!r}")
+        finally:
+            metrics_tracker.record_duration(
+                self.name, r, "rsu_round_execution",
+                time.perf_counter() - rsu_t0,
+            )
+
+    def _aggregate_round(self, r, data):
+        """Verify, trust-filter, FedAvg and forward one round's cluster data."""
         valid_entries = []  # (sender, weights)
         participants = [d["sender"] for d in data if d.get("sender")]
 
@@ -335,7 +370,7 @@ class RSU:
             )
             for name, deviation, accepted in trust_log:
                 tau = 1 if accepted else 0
-                print(f"[{self.name}] [TRUST] {name}: ∂={deviation:.4f} → τ={tau}")
+                print(f"[{self.name}] [TRUST] {name}: deviation={deviation:.4f} -> tau={tau}")
                 if not accepted:
                     print(f"[{self.name}] [TRUST] Declined communication from {name} (malicious/outlier)")
         else:
@@ -371,38 +406,38 @@ class RSU:
             send_msg(("127.0.0.1", self.server_port), msg, sender_name=self.name, round_num=r)
         else:
             print(f"[{self.name}] [!] 0 valid vehicle weights for Round {r}.")
-            if (self.security_enabled and self.signer is not None
-                    and self.security_authority is not None):
-                payload = b""
-                with Timer(self.name, r, "signature_generation"):
-                    signature = self.signer.sign(payload)
-                with Timer(self.name, r, "encryption"):
-                    aad = message_aad(
-                        "NO_CLUSTER_UPDATE", self.name, "Server", r)
-                    server_info = self.security_authority.public_info("Server")
-                    shared_secret = self.signer.shared_secret_for(server_info)
-                    ciphertext, nonce, tag = encrypt_payload(
-                        shared_secret, payload, aad)
-                msg = build_envelope(
-                    "NO_CLUSTER_UPDATE", self.signer, "Server", r,
-                    signature, ciphertext, nonce, tag,
-                )
-                msg["rsu_port"] = self.port
-            else:
-                msg = {
-                    "type": "NO_CLUSTER_UPDATE",
-                    "rsu_port": self.port,
-                    "sender": self.name,
-                    "recipient": "Server",
-                    "round": r,
-                }
-            send_msg(
-                ("127.0.0.1", self.server_port), msg,
-                sender_name=self.name, round_num=r,
-            )
+            self._send_no_cluster_update(r)
 
-        metrics_tracker.record_duration(
-            self.name, r, "rsu_round_execution", time.perf_counter() - rsu_t0
+    def _send_no_cluster_update(self, r):
+        """Authenticated control-plane report: this cluster has no model."""
+        if (self.security_enabled and self.signer is not None
+                and self.security_authority is not None):
+            payload = b""
+            with Timer(self.name, r, "signature_generation"):
+                signature = self.signer.sign(payload)
+            with Timer(self.name, r, "encryption"):
+                aad = message_aad(
+                    "NO_CLUSTER_UPDATE", self.name, "Server", r)
+                server_info = self.security_authority.public_info("Server")
+                shared_secret = self.signer.shared_secret_for(server_info)
+                ciphertext, nonce, tag = encrypt_payload(
+                    shared_secret, payload, aad)
+            msg = build_envelope(
+                "NO_CLUSTER_UPDATE", self.signer, "Server", r,
+                signature, ciphertext, nonce, tag,
+            )
+            msg["rsu_port"] = self.port
+        else:
+            msg = {
+                "type": "NO_CLUSTER_UPDATE",
+                "rsu_port": self.port,
+                "sender": self.name,
+                "recipient": "Server",
+                "round": r,
+            }
+        return send_msg(
+            ("127.0.0.1", self.server_port), msg,
+            sender_name=self.name, round_num=r,
         )
 
     def _force_aggregate(self, r):
@@ -423,6 +458,25 @@ class RSU:
         timer = self._round_timers.pop(r, None)
         if timer:
             timer.cancel()
+        self._round_deadlines.pop(r, None)
+
+    def _restart_round_timer_locked(self, r):
+        """(Re)arm the inactivity window for round *r*, honouring the hard cap.
+
+        Must be called with self._lock held.
+        """
+        timer = self._round_timers.pop(r, None)
+        if timer:
+            timer.cancel()
+        hard_cap = self._round_deadlines.get(r)
+        remaining = RSU_ROUND_TIMEOUT
+        if hard_cap is not None:
+            remaining = min(
+                remaining, max(hard_cap - time.perf_counter(), 0.0))
+        timer = threading.Timer(remaining, self._force_aggregate, args=[r])
+        timer.daemon = True
+        timer.start()
+        self._round_timers[r] = timer
 
     def start(self):
         self.receiver.start()

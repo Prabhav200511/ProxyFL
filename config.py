@@ -5,10 +5,20 @@
 # ==========================================
 TOTAL_ROUNDS = 40
 SIMULATION_SEED = 42
-RSU_ROUND_TIMEOUT = 25       # seconds — deadline for RSU to collect cluster updates
-SERVER_ROUND_TIMEOUT = 30    # seconds — deadline for Server to collect RSU updates
-# Timeout invariant: device wait timeout must cover the worst-case cascade (RSU + Server) + 15s buffer
-TIMEOUT = RSU_ROUND_TIMEOUT + SERVER_ROUND_TIMEOUT + 15  # 70s
+# Aggregation deadlines are INACTIVITY windows, not hard round deadlines: the
+# window restarts every time a new participant reports, bounded by the MAX_WAIT
+# cap measured from the first report of the round.  A fixed 25s deadline
+# measured from the first arrival discarded most of every cluster, because
+# local training is serialized by TRAINING_SEMAPHORE and the last vehicle in a
+# cluster finishes minutes after the first.
+RSU_ROUND_TIMEOUT = 45       # seconds — inactivity window for cluster updates
+RSU_ROUND_MAX_WAIT = 150     # seconds — hard cap from the round's first report
+SERVER_ROUND_TIMEOUT = 45    # seconds — inactivity window for RSU updates
+SERVER_ROUND_MAX_WAIT = 180  # seconds — hard cap from the round's first report
+# Timeout invariant: device wait timeout must cover the worst-case cascade
+# (RSU cap + Server cap) plus a buffer.  Every RSU/Server code path is
+# guaranteed to emit a downstream message, so this is a failsafe only.
+TIMEOUT = RSU_ROUND_MAX_WAIT + SERVER_ROUND_MAX_WAIT + 30  # 360s
 BATCH_SIZE = 32
 LOCAL_EPOCHS = 3
 
@@ -30,8 +40,14 @@ TRUST_MEDIAN_MULTIPLIER = 3.0
 # V2V PROXY SHARING (Eq. 6)
 # ==========================================
 V2V_ENABLED = True
-V2V_COLLECT_TIMEOUT = 2.0   # seconds to wait for in-range peer proxies
-V2V_READY_TIMEOUT = 2.0     # seconds to wait for in-range peers to finish training
+# Local training is staggered by TRAINING_SEMAPHORE, so in-range peers reach
+# their gossip phase tens of seconds apart.  With a 2s rendezvous barrier the
+# barrier always timed out and Eq. (6) degenerated into "no peer proxies
+# received" every round -- V2V sharing never actually happened.  The barrier
+# must be able to span the straggler spread; the collect window only has to
+# span one round-trip once the peers are aligned.
+V2V_COLLECT_TIMEOUT = 10.0  # seconds to wait for in-range peer proxies
+V2V_READY_TIMEOUT = 90.0    # seconds to wait for in-range peers to finish training
 
 # ==========================================
 # ENERGY MODEL (OBU power profile)
@@ -98,6 +114,19 @@ MAX_NETWORK_MESSAGE_BYTES = 16 * 1024 * 1024
 # HARDWARE & CONCURRENCY SAFETY (SIGABRT Prevention)
 # ==========================================
 import os
+import sys
+
+# Console safety: a single non-ASCII character in a log line used to raise
+# UnicodeEncodeError on Windows' cp1252 stdout.  Those prints happen inside
+# RSU/Server receiver threads, where the exception aborted an in-flight
+# aggregation and silently lost the whole round.  Force a lossy UTF-8 console
+# so logging can never affect protocol behaviour.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"

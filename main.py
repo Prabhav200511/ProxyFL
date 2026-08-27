@@ -30,7 +30,9 @@ from rsu import RSU
 from vanet_sim import VanetTopology, format_vehicle_id, place_rsu, spawn_vehicle
 from shared_logger import logger
 from models import VANET_PRIVATE_ARCHITECTURES, MNIST_PRIVATE_ARCHITECTURES
-from crypto_protocol import Authority
+from crypto_protocol import (
+    Authority, MIRACL_BRIDGE_AVAILABLE, MIRACL_SYMMETRIC_BACKEND,
+)
 from metrics import metrics_tracker
 from data_utils import prepare_vanet_partitions
 
@@ -67,6 +69,12 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
     print(f" Total Communication Rounds: {total_rounds}")
     print(f" Heterogeneous Private Architectures: {heterogeneous}")
     print(f" Security Enabled: {security} | Batch Verification: {batch_verify}")
+    if security:
+        print(f" EC arithmetic: MIRACL Core NIST256 (Python)")
+        print(f" Hash / AEAD  : {MIRACL_SYMMETRIC_BACKEND}")
+        if not MIRACL_BRIDGE_AVAILABLE:
+            print(" [NOTE] Build crypto_protocol/miracl_core.dll to route "
+                  "SHA-256 and AES-256-GCM through MIRACL Core C.")
     print(f"{'=' * 65}\n")
 
     # Reset logging, metrics & synchronization

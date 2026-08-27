@@ -1,8 +1,8 @@
 # server.py — Central Server for ProxyFL
 #
-# Receives cluster-aggregated proxy weights from RSUs, applies
-# JSD-weighted global aggregation, evaluates the global proxy model
-# on held-out attack test data, and broadcasts the result back.
+# Receives cluster-aggregated proxy weights from RSUs, applies unweighted
+# FedAvg global aggregation (Eq. 8), evaluates the global proxy model on
+# held-out attack test data, and broadcasts the result back.
 
 import threading
 import os
@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader
 
 from config import (
     TOTAL_ROUNDS, DEVICE, RSU_BASE_PORT, SERVER_ROUND_TIMEOUT,
-    SIMULATION_SEED,
+    SERVER_ROUND_MAX_WAIT, SIMULATION_SEED,
     SECURITY_ENABLED, BATCH_VERIFICATION_ENABLED
 )
 from data_utils import VANETDataset, get_vanet_scaler
@@ -91,6 +91,7 @@ class Server:
         self.completed_rounds = set()
         self.rsu_ports = [RSU_BASE_PORT + i for i in range(expected_rsus)]
         self._round_timers = {}
+        self._round_deadlines = {}  # round -> hard cap (perf_counter)
         self._lock = threading.Lock()  # protects round_buffers, completed_rounds, rsu_ports, _round_timers
         self.receiver = Receiver(self.port, self.on_receive, node_name="Server")
 
@@ -240,16 +241,15 @@ class Server:
                 if r not in self.round_buffers:
                     self.round_buffers[r] = []
                     self.round_reported[r] = set()
-                    timer = threading.Timer(
-                        SERVER_ROUND_TIMEOUT, self._force_aggregate, args=[r])
-                    timer.daemon = True
-                    timer.start()
-                    self._round_timers[r] = timer
+                    self._round_deadlines[r] = (
+                        time.perf_counter() + SERVER_ROUND_MAX_WAIT)
 
                 if sender in self.round_reported[r]:
                     return
                 if sender:
                     self.round_reported[r].add(sender)
+                # Restart the inactivity window so slow clusters still count.
+                self._restart_round_timer_locked(r)
 
                 if msg_type == "CLUSTER_UPDATE":
                     entry = {
@@ -298,6 +298,13 @@ class Server:
     # Aggregation
     # ------------------------------------------------------------------
     def aggregate(self, r):
+        """Aggregate one round; always broadcast a global and close the round.
+
+        Aggregation runs inside a receiver thread.  An unhandled exception here
+        would leave every RSU (and therefore every vehicle) waiting for a
+        global update that is never sent, so the round is finished on every
+        path -- including the failure path.
+        """
         server_t0 = time.perf_counter()
         with self._lock:
             if r in self.completed_rounds:
@@ -309,6 +316,36 @@ class Server:
             rsu_directory_snapshot = dict(self.rsu_directory)
             round_start_t = self.round_start_times.pop(r, server_t0)
 
+        try:
+            self._aggregate_round(
+                r, data, rsu_directory_snapshot, round_start_t)
+        except Exception as exc:
+            print(f"[SERVER] [ERROR] Round {r} aggregation failed: {exc!r}. "
+                  "Broadcasting the last known global proxy so the round "
+                  "still closes.")
+            import traceback
+            traceback.print_exc()
+            try:
+                fallback = {
+                    key: value.cpu()
+                    for key, value in self.model.state_dict().items()
+                }
+                self._broadcast_global(r, fallback, rsu_directory_snapshot)
+                metrics_tracker.record_value(
+                    "Server", r, "successful_updates", 0.0)
+            except Exception as fallback_exc:
+                print(f"[SERVER] [ERROR] Global broadcast fallback failed for "
+                      f"round {r}: {fallback_exc!r}")
+        finally:
+            metrics_tracker.record_duration(
+                "Server", r, "server_round_execution",
+                time.perf_counter() - server_t0,
+            )
+            if r >= self.total_rounds:
+                training_done_event.set()
+
+    def _aggregate_round(self, r, data, rsu_directory_snapshot, round_start_t):
+        """Verify, FedAvg, evaluate and broadcast one round's cluster models."""
         if not data:
             self._print_in_range_vehicle_counts(r)
             print(f"[SERVER] Round {r}: no RSU supplied a model update; "
@@ -318,12 +355,6 @@ class Server:
             self._broadcast_global(r, weights, rsu_directory_snapshot)
             metrics_tracker.record_value(
                 "Server", r, "successful_updates", 0.0)
-            metrics_tracker.record_duration(
-                "Server", r, "server_round_execution",
-                time.perf_counter() - server_t0,
-            )
-            if r >= self.total_rounds:
-                training_done_event.set()
             return
 
         self._print_in_range_vehicle_counts(r)
@@ -400,20 +431,10 @@ class Server:
             self._broadcast_global(r, weights, rsu_directory_snapshot)
             metrics_tracker.record_value(
                 "Server", r, "successful_updates", 0.0)
-            metrics_tracker.record_duration(
-                "Server", r, "server_round_execution",
-                time.perf_counter() - server_t0,
-            )
-            if r >= self.total_rounds:
-                training_done_event.set()
             return
 
         # Equation (8): central server forms the arithmetic mean of RSU models.
         global_weights = average_weights(cluster_weights)
-        divergences = []
-
-        for i, div in enumerate(divergences):
-            logger.log_jsd(r, f"Cluster_{i + 1}", div)
 
         # Evaluate
         acc, f1, recall = self.evaluate_global_model(global_weights)
@@ -459,7 +480,6 @@ class Server:
         metrics_tracker.record_value("Server", r, "throughput_bytes_per_sec", throughput_bps)
         metrics_tracker.record_value(
             "Server", r, "model_payload_bytes_rx", total_bytes)
-        metrics_tracker.record_duration("Server", r, "server_round_execution", time.perf_counter() - server_t0)
 
         print(f"\n[SERVER] --- ROUND {r} GLOBAL PROXY METRICS ---")
         print(f"         Test Accuracy : {round(acc * 100, 2)}%")
@@ -471,10 +491,8 @@ class Server:
         # Broadcast global proxy to all RSUs
         self._broadcast_global(r, global_weights, rsu_directory_snapshot)
 
-        if r >= self.total_rounds:
-            training_done_event.set()
-
     def _force_aggregate(self, r):
+        force_t0 = time.perf_counter()
         with self._lock:
             if r in self.completed_rounds:
                 return
@@ -489,17 +507,28 @@ class Server:
                 self._cancel_timer_locked(r)
                 self.round_buffers.pop(r, None)
                 self.round_reported.pop(r, None)
+                self.round_start_times.pop(r, None)
                 rsu_directory_snapshot = dict(self.rsu_directory)
 
         if has_data:
             self.aggregate(r)
-        else:
+            return
+
+        try:
             self._print_in_range_vehicle_counts(r)
             weights = {
                 k: v.cpu() for k, v in self.model.state_dict().items()}
             self._broadcast_global(r, weights, rsu_directory_snapshot)
             metrics_tracker.record_value(
                 "Server", r, "successful_updates", 0.0)
+        except Exception as exc:
+            print(f"[SERVER] [ERROR] Empty-round broadcast failed for round "
+                  f"{r}: {exc!r}")
+        finally:
+            metrics_tracker.record_duration(
+                "Server", r, "server_round_execution",
+                time.perf_counter() - force_t0,
+            )
             if r >= self.total_rounds:
                 training_done_event.set()
 
@@ -508,6 +537,25 @@ class Server:
         timer = self._round_timers.pop(r, None)
         if timer:
             timer.cancel()
+        self._round_deadlines.pop(r, None)
+
+    def _restart_round_timer_locked(self, r):
+        """(Re)arm the inactivity window for round *r*, honouring the hard cap.
+
+        Must be called with self._lock held.
+        """
+        timer = self._round_timers.pop(r, None)
+        if timer:
+            timer.cancel()
+        hard_cap = self._round_deadlines.get(r)
+        remaining = SERVER_ROUND_TIMEOUT
+        if hard_cap is not None:
+            remaining = min(
+                remaining, max(hard_cap - time.perf_counter(), 0.0))
+        timer = threading.Timer(remaining, self._force_aggregate, args=[r])
+        timer.daemon = True
+        timer.start()
+        self._round_timers[r] = timer
 
     # ------------------------------------------------------------------
     # Startup / Shutdown
