@@ -177,7 +177,7 @@ def plot_grid_results(summary_df, detailed_df, dataset_name="vanet", out_dir="ex
             plt.plot(sub['total_nodes'], sub['final_global_proxy_acc'],
                      marker='o', linewidth=2.2, label=f"{cluster} Clusters")
 
-        plt.xlabel('Total Nodes in Network (Clusters × Vehicles)', fontsize=12, fontweight='bold')
+        plt.xlabel('Total Nodes in Network (Clusters x Vehicles)', fontsize=12, fontweight='bold')
         plt.ylabel('Final Global Proxy Accuracy (%)', fontsize=12, fontweight='bold')
         plt.title(f'[{ds_label}] Accuracy vs Total Network Nodes', fontsize=14, fontweight='bold')
         plt.legend(title="Cluster Configuration", fontsize=10)
@@ -255,7 +255,7 @@ def run_dataset_grid(dataset, clusters, vehicles, rounds, out_dir, resume):
                 continue
 
             total_nodes = c * v
-            print(f"\n>>> [{dataset.upper()} {current_idx}/{total_configs}] Running: {c} Clusters × {v} Vehicles = {total_nodes} Nodes (Rounds={rounds})...")
+            print(f"\n>>> [{dataset.upper()} {current_idx}/{total_configs}] Running: {c} Clusters x {v} Vehicles = {total_nodes} Nodes (Rounds={rounds})...")
 
             start_time = time.time()
             log_file = f"{dataset}_training_logs.txt"
@@ -352,7 +352,7 @@ def run_dataset_grid(dataset, clusters, vehicles, rounds, out_dir, resume):
             # Brief pause to ensure all sockets release cleanly
             time.sleep(1.5)
 
-    print(f"\n[✓] Completed Grid Experiments for {dataset.upper()}!")
+    print(f"\n[OK] Completed Grid Experiments for {dataset.upper()}!")
     print(f"    - Summary CSV:  {summary_csv_path}")
     print(f"    - Detailed CSV: {detailed_csv_path}")
     print(f"    - Heatmaps & Scaling Plots saved in '{out_dir}/'")

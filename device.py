@@ -88,6 +88,7 @@ class Device:
         self.port = port
         self.rsu_port = rsu_port
         self.rsu_name = rsu_name
+        self.device_id = int(device_id)
         self.topology = topology
         self.peer_directory = peer_directory or {}
         self.dataset_type = dataset_type
@@ -277,7 +278,14 @@ class Device:
 
     def _handle_verified_global(self, round_num, weights):
         """Apply a verified global only after this round's local work is done."""
-        if round_num != self.current_round:
+        if round_num < self.current_round:
+            return
+        if round_num > self.current_round:
+            # A lagging vehicle used to discard globals for rounds it had not
+            # reached yet and then stall for the full failsafe timeout on
+            # arrival.  Stash it so _apply_pending_global can consume it.
+            with self.proxy_lock:
+                self._pending_global_updates[round_num] = weights
             return
         applied = False
         with self.proxy_lock:
@@ -303,7 +311,7 @@ class Device:
         msg_type = msg.get("type") if isinstance(msg, dict) else None
         if msg_type == "GLOBAL_UPDATE":
             msg_round = msg.get("round", None)
-            if isinstance(msg_round, int) and msg_round == self.current_round:
+            if isinstance(msg_round, int) and msg_round >= self.current_round:
                 weights = self._decode_rsu_global(msg)
                 if weights is None:
                     print(f"[{self.name}] [SECURITY] Dropped invalid GLOBAL_UPDATE")
@@ -615,11 +623,15 @@ class Device:
             self.round_event.clear()
             with self.proxy_lock:
                 self._round_phase = ROUND_TRAINING
-                self._pending_global_updates.pop(r, None)
+                # Keep any global for round r that arrived while this vehicle
+                # was still finishing round r-1; drop only stale ones.
+                for stale in [
+                        key for key in self._pending_global_updates if key < r]:
+                    self._pending_global_updates.pop(stale, None)
             with self._peer_lock:
                 self._peer_buffers[r] = {}
 
-            if self.name.endswith("_V1"):
+            if self.device_id == 0:
                 print(f"\n[{'=' * 15} ROUND {r} {'=' * 15}]")
 
             # 1. Train with DML
@@ -677,11 +689,16 @@ class Device:
                 ready_neighbors = self.topology.get_v2v_neighbors(
                     self.name, peers)
                 self.topology.mark_v2v_ready(self.name, r)
-                self.topology.wait_for_v2v_ready(
+                rendezvous = self.topology.wait_for_v2v_ready(
                     self.name, r, ready_neighbors, V2V_READY_TIMEOUT)
+                if ready_neighbors and not rendezvous:
+                    print(f"[{self.name}] V2V: rendezvous timed out after "
+                          f"{V2V_READY_TIMEOUT:.0f}s; peers "
+                          f"{ready_neighbors} did not all reach round {r}")
 
             # 5. Check V2RSU range -> send proxy to RSU & wait for global round sync
-            self._round_phase = ROUND_REPORTING
+            with self.proxy_lock:
+                self._round_phase = ROUND_REPORTING
             dist = self.topology.get_distance_to_rsu(
                 self.name, self.rsu_name)
             can_reach = self.topology.can_reach_rsu(
@@ -726,7 +743,8 @@ class Device:
                     self._request_sent_at[r] = send_started
 
                 # Wait for global update for this round
-                self._round_phase = ROUND_WAITING_GLOBAL
+                with self.proxy_lock:
+                    self._round_phase = ROUND_WAITING_GLOBAL
                 received = (
                     self._apply_pending_global(r)
                     or self.round_event.wait(timeout=TIMEOUT)
@@ -740,7 +758,8 @@ class Device:
                 send_started = time.perf_counter()
                 if self._send_no_update(r):
                     self._request_sent_at[r] = send_started
-                self._round_phase = ROUND_WAITING_GLOBAL
+                with self.proxy_lock:
+                    self._round_phase = ROUND_WAITING_GLOBAL
                 received = (
                     self._apply_pending_global(r)
                     or self.round_event.wait(timeout=TIMEOUT)
@@ -754,7 +773,8 @@ class Device:
                 send_started = time.perf_counter()
                 if self._send_no_update(r):
                     self._request_sent_at[r] = send_started
-                self._round_phase = ROUND_WAITING_GLOBAL
+                with self.proxy_lock:
+                    self._round_phase = ROUND_WAITING_GLOBAL
                 received = (
                     self._apply_pending_global(r)
                     or self.round_event.wait(timeout=TIMEOUT)

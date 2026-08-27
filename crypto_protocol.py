@@ -38,6 +38,18 @@ POINT_BYTES = int(_curve.EFS)  # 32 for NIST256
 
 _MIRACL_BRIDGE = Path(__file__).resolve().parent / "crypto_protocol" / "miracl_core.dll"
 _bridge = ctypes.CDLL(str(_MIRACL_BRIDGE)) if _MIRACL_BRIDGE.is_file() else None
+
+# True only when crypto_protocol/miracl_core.dll has been built (see
+# crypto_protocol/build_miracl_bridge.bat).  Elliptic-curve arithmetic always
+# comes from the vendored MIRACL Core Python modules; SHA-256 and AES-256-GCM
+# come from MIRACL only when this flag is True, and otherwise fall back to
+# hashlib / the `cryptography` package.  Reported crypto timings differ between
+# the two backends, so the active backend is part of every measurement.
+MIRACL_BRIDGE_AVAILABLE = _bridge is not None
+MIRACL_SYMMETRIC_BACKEND = (
+    "MIRACL Core C (hash.c/aes.c/gcm.c)" if MIRACL_BRIDGE_AVAILABLE
+    else "hashlib SHA-256 + cryptography AES-256-GCM (MIRACL bridge not built)"
+)
 _UBytePointer = ctypes.POINTER(ctypes.c_ubyte)
 if _bridge is not None:
     _bridge.proxyfl_miracl_sha256.argtypes = [

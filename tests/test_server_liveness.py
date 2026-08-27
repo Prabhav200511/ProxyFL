@@ -15,6 +15,7 @@ class ServerLivenessTests(unittest.TestCase):
         server._lock = threading.Lock()
         server.completed_rounds = set()
         server._round_timers = {}
+        server._round_deadlines = {}
         server.round_buffers = {1: [{
             "sender": "RSU_0_Central",
             "raw_msg": {"avg_weights": b"not-a-model"},

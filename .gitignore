@@ -32,3 +32,5 @@ Thumbs.db
 # VS Code / PyCharm settings
 .vscode/
 .idea/
+# Generated plot output directory
+plots/
