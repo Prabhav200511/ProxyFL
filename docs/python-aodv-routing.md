@@ -104,6 +104,34 @@ The host cost of executing the simulator is still real wall-clock work.
 
 ## Stationary vehicles and limitations
 
+### Why the synthetic mobility graph rises and falls
+
+The example is a deliberately scripted network scenario, not a measured FL
+training trajectory. Its routing-control volume (including headers) is:
+
+| Round | Routing bytes transmitted | Cause |
+| --- | ---: | --- |
+| 1 | 200 | Initial route discovery: requests and replies |
+| 2–3 | 0 | Reuse the established route |
+| 4 | 392 | Break a link, report the error, discover a longer alternate route |
+| 5 | 0 | Reuse the alternate route |
+| 6 | 312 | Disconnected: three failed discovery attempts; no data arrives |
+| 7 | 352 | Connectivity returns; discover the route again |
+| 8 | 0 | Reuse the recovered route |
+
+Zero routing-control bytes do **not** mean zero communication: data packets
+continue over a cached route. Conversely, the fall in total communication volume
+at round 6 means failed data delivery, not an efficiency gain. Normalized Routing
+Load is undefined there because its delivered-packet denominator is zero.
+The latency spike at round 6 is the modeled discovery timeout/retry wait.
+
+Graph labels spell out **Ad hoc On-Demand Distance Vector (AODV)**, **Route
+Request (RREQ)**, **Route Reply (RREP)**, **Route Error (RERR)**, **Normalized
+Routing Load (NRL)**, **Federated Learning (FL)**, **Internet Protocol (IP)**,
+and **User Datagram Protocol (UDP)**. KiB means kibibytes (1,024 bytes).
+
+### What to expect without mobility
+
 Stationarity prevents mobility-induced breaks but does not increase the radio's
 capacity by itself. Successful route reuse can reduce discovery overhead and
 network latency, followed by a plateau. With the default 3-second active-route

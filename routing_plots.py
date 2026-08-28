@@ -21,7 +21,7 @@ def build_routing_figures(csv_path, prefix=""):
         return {}
     frame = pd.read_csv(csv_path).sort_values("round")
     rounds = frame["round"]
-    title_suffix = f" ({prefix.upper()})" if prefix else ""
+    title_suffix = f" ({prefix.replace('_', ' ').upper()})" if prefix else ""
     if "synthetic" in metadata.get("traffic", "").lower():
         title_suffix += " - synthetic traffic"
     figures = {}
@@ -40,30 +40,43 @@ def build_routing_figures(csv_path, prefix=""):
         ax.set_xlim(rounds.min() - margin, rounds.max() + margin)
         return ax
 
-    ax = figure("aodv_routing_overhead_vs_rounds", "AODV routing transmissions (including IP/UDP)", "Transmitted volume (KiB)")
+    ax = figure("aodv_routing_overhead_vs_rounds",
+                "Ad hoc On-Demand Distance Vector (AODV)\n"
+                "Routing transmissions, including Internet Protocol / User Datagram Protocol headers",
+                "Transmitted volume (kibibytes, KiB)")
     total = frame["rreq_bytes_tx"] + frame["rrep_bytes_tx"] + frame["rerr_bytes_tx"]
-    for kind in ("rreq", "rrep", "rerr"):
-        ax.plot(rounds, frame[kind + "_bytes_tx"] / 1024, marker="o", label=kind.upper() + " + headers")
+    for kind, full_name in (("rreq", "Route Request (RREQ)"),
+                            ("rrep", "Route Reply (RREP)"),
+                            ("rerr", "Route Error (RERR)")):
+        ax.plot(rounds, frame[kind + "_bytes_tx"] / 1024, marker="o",
+                label=full_name + "\n+ headers")
     ax.plot(rounds, total / 1024, marker="s", linewidth=2, label="Total routing")
     shared._legend_above()
 
-    ax = figure("communication_volume_vs_rounds", "Wireless communication volume (IP boundary)", "Transmitted volume (KiB)")
-    for column, label in (("fl_application_bytes_tx", "FL/application"), ("security_bytes_tx", "Security increment"),
-                          ("routing_control_bytes_tx", "Routing bodies"), ("ip_udp_header_bytes_tx", "All IP/UDP headers")):
+    ax = figure("communication_volume_vs_rounds", "Wireless communication volume (Internet Protocol boundary)",
+                "Transmitted volume (kibibytes, KiB)")
+    for column, label in (("fl_application_bytes_tx", "Federated Learning (FL) /\napplication"),
+                          ("security_bytes_tx", "Security increment"),
+                          ("routing_control_bytes_tx", "Routing bodies"),
+                          ("ip_udp_header_bytes_tx", "Internet Protocol (IP) /\nUser Datagram Protocol (UDP) headers")):
         ax.plot(rounds, frame[column] / 1024, marker="o", label=label)
     ax.plot(rounds, frame["total_wireless_bytes_tx"] / 1024, color="black", linestyle="--", label="Total")
     shared._legend_above()
 
-    ax = figure("normalized_routing_load_vs_rounds", "Normalized routing load", "Control packet TX /\nfinal data packet arrivals")
-    ax.plot(rounds, frame["normalized_routing_load"], marker="o", label="NRL (ratio of network totals)")
+    ax = figure("normalized_routing_load_vs_rounds", "Normalized Routing Load (NRL)",
+                "Control packet transmissions /\nfinal data packet arrivals")
+    ax.plot(rounds, frame["normalized_routing_load"], marker="o", label="Normalized Routing Load (NRL)")
     for round_num in frame.loc[frame["normalized_routing_load"].isna(), "round"]:
-        ax.annotate("N/A\nno data", (round_num, 0.03), xycoords=("data", "axes fraction"), ha="center", fontsize=8)
+        ax.annotate("Undefined\n(no data arrivals)", (round_num, 0.03),
+                    xycoords=("data", "axes fraction"), ha="center", fontsize=8)
     ax.set_ylim(bottom=0)
     shared._legend_above()
 
-    ax = figure("aodv_network_latency_vs_rounds", "Modeled network latency (not FL wall-clock time)", "Mean simulated latency (seconds)")
+    ax = figure("aodv_network_latency_vs_rounds", "Modeled network latency\n(not Federated Learning wall-clock time)",
+                "Mean simulated latency (seconds)")
     ax.plot(rounds, frame["successful_network_latency_mean_s"], marker="o", label="Successful envelopes")
-    ax.plot(rounds, frame["network_latency_mean_s"], marker="s", linestyle="--", label="All attempts incl. failed discovery")
+    ax.plot(rounds, frame["network_latency_mean_s"], marker="s", linestyle="--",
+            label="All attempts, including failed route discovery")
     shared._legend_above()
     return figures
 

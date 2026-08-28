@@ -27,10 +27,23 @@ class RoutingPlotTests(unittest.TestCase):
                 route = figures["aodv_routing_overhead_vs_rounds"].axes[0]
                 self.assertEqual(list(route.lines[0].get_ydata()), [104 / 1024, 156 / 1024])
                 self.assertEqual(list(route.lines[3].get_ydata()), [200 / 1024, 156 / 1024])
+                self.assertIn("Ad hoc On-Demand Distance Vector", route.get_title())
+                for line, full_name, values in zip(route.lines, (
+                        "Route Request (RREQ)", "Route Reply (RREP)", "Route Error (RERR)"), (
+                        [104 / 1024, 156 / 1024], [96 / 1024, 0], [0, 0])):
+                    self.assertIn(full_name, line.get_label())
+                    self.assertEqual(list(line.get_ydata()), values)
+                self.assertIn("kibibytes", route.get_ylabel())
+                volume = figures["communication_volume_vs_rounds"].axes[0]
+                self.assertIn("Federated Learning", volume.lines[0].get_label())
+                self.assertIn("Internet Protocol", volume.lines[3].get_label())
+                self.assertIn("User Datagram Protocol", volume.lines[3].get_label())
                 nrl = figures["normalized_routing_load_vs_rounds"].axes[0]
+                self.assertIn("Normalized Routing Load (NRL)", nrl.get_title())
+                self.assertIn("transmissions", nrl.get_ylabel())
                 self.assertEqual(nrl.lines[0].get_ydata()[0], 2)
                 self.assertNotEqual(nrl.lines[0].get_ydata()[1], nrl.lines[0].get_ydata()[1])
-                self.assertTrue(any("N/A" in text.get_text() for text in nrl.texts))
+                self.assertTrue(any("Undefined" in text.get_text() for text in nrl.texts))
                 self.assertGreaterEqual(nrl.get_xlim()[1], 2)
                 self.assertIn("synthetic", route.get_title().lower())
             finally:
