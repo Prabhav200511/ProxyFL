@@ -20,7 +20,19 @@ __pycache__/
 venv/
 env/
 .venv/
+.venv_gpu/
 .env
+.pytest_cache/
+
+# Local native build outputs and obsolete MIRACL mirrors
+/crypto_protocol/build/
+/crypto_protocol/miracl_core.dll
+/crypto_protocol/miracl_core.exp
+/crypto_protocol/miracl_core.lib
+/crypto_protocol/miracl_native/
+/crypto_protocol/miracl_lib/
+/sec256k1/
+/*.obj
 
 # ========================
 # OS & IDEs
