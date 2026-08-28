@@ -53,11 +53,13 @@ class Server:
                  security_authority=None, security_identity=None, topology=None,
                  cluster_vehicle_names=None, security_enabled=None,
                  batch_verification_enabled=None, rsu_directory=None,
-                 vanet_scaler=None, random_seed=SIMULATION_SEED):
+                 vanet_scaler=None, random_seed=SIMULATION_SEED, aodv_enabled=False):
         self.port = port
         self.expected_rsus = expected_rsus
         self.dataset_type = dataset_type
         self.total_rounds = total_rounds
+        self.aodv_enabled = aodv_enabled
+        self._shutdown = False
         self.security_authority = security_authority
         self.signer = security_identity
         self.topology = topology
@@ -343,6 +345,8 @@ class Server:
             )
             if r >= self.total_rounds:
                 training_done_event.set()
+            else:
+                self._arm_silent_round(r + 1)
 
     def _aggregate_round(self, r, data, rsu_directory_snapshot, round_start_t):
         """Verify, FedAvg, evaluate and broadcast one round's cluster models."""
@@ -531,6 +535,8 @@ class Server:
             )
             if r >= self.total_rounds:
                 training_done_event.set()
+            else:
+                self._arm_silent_round(r + 1)
 
     def _cancel_timer_locked(self, r):
         """Cancel a round timer. Must be called with self._lock held."""
@@ -563,9 +569,30 @@ class Server:
     def start(self):
         print(f"[SERVER] Listening on port {self.port} | device={DEVICE}")
         self.receiver.start()
+        self._arm_silent_round(1)
+
+    def _arm_silent_round(self, r):
+        """Start the AODV no-traffic cap without fabricating an RSU report."""
+        if not getattr(self, "aodv_enabled", False) or r > self.total_rounds:
+            return
+        with self._lock:
+            if getattr(self, "_shutdown", False) or r in self.completed_rounds or r in self._round_timers:
+                return
+            self.round_buffers.setdefault(r, [])
+            self.round_reported.setdefault(r, set())
+            self.round_start_times.setdefault(r, time.perf_counter())
+            self._round_deadlines[r] = time.perf_counter() + SERVER_ROUND_MAX_WAIT
+            timer = threading.Timer(SERVER_ROUND_MAX_WAIT, self._force_aggregate, args=[r])
+            timer.daemon = True
+            self._round_timers[r] = timer
+            timer.start()
 
     def shutdown(self):
         """Close the listening socket so the port is freed."""
+        with self._lock:
+            self._shutdown = True
+            for r in list(self._round_timers):
+                self._cancel_timer_locked(r)
         try:
             self.receiver.shutdown()
         except Exception:

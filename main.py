@@ -35,22 +35,50 @@ from crypto_protocol import (
 )
 from metrics import metrics_tracker
 from data_utils import prepare_vanet_partitions
+from network import WirelessRouter
+from routing_sim import RoutingSimulator
+
+
+def cluster_layout(count):
+    """Keep the default layout; extend explicit grid runs on a 1,800m lattice."""
+    if count is None:
+        return list(RSU_LAYOUT)
+    if type(count) is not int or not 1 <= count <= 20:
+        raise ValueError("clusters must be 1..20 (bounded by existing TCP port allocation)")
+    specs = list(RSU_LAYOUT[:count])
+    occupied = {(x, y) for _, _, x, y in specs}
+    radius = 1
+    while len(specs) < count:
+        for x in range(-radius, radius + 1):
+            for y in range(-radius, radius + 1):
+                position = (x * 1800, y * 1800)
+                if position not in occupied and len(specs) < count:
+                    specs.append((f"RSU_{len(specs)}_Grid", "Grid", *position))
+                    occupied.add(position)
+        radius += 1
+    return specs
 
 
 def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True,
                            security=SECURITY_ENABLED,
                            batch_verify=BATCH_VERIFICATION_ENABLED,
-                           seed=SIMULATION_SEED):
+                           seed=SIMULATION_SEED, routing="direct", clusters=None, vehicles=None):
     """Run one full federated learning simulation for a given dataset."""
+    if routing not in {"direct", "aodv"}:
+        raise ValueError("routing must be direct or aodv")
+    if type(total_rounds) is not int or total_rounds < 1:
+        raise ValueError("rounds must be positive")
+    if vehicles is not None and (type(vehicles) is not int or not 1 <= vehicles <= 99):
+        raise ValueError("vehicles per cluster must be 1..99")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     config.SECURITY_ENABLED = security
     config.BATCH_VERIFICATION_ENABLED = batch_verify
 
-    cluster_specs = list(RSU_LAYOUT)
+    cluster_specs = cluster_layout(clusters)
     vehicle_counts = {
-        rsu_name: random.randint(*VEHICLES_PER_CLUSTER_RANGE)
+        rsu_name: vehicles if vehicles is not None else random.randint(*VEHICLES_PER_CLUSTER_RANGE)
         for rsu_name, _, _, _ in cluster_specs
     }
     total_vehicles = sum(vehicle_counts.values())
@@ -133,6 +161,14 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
         rsu_name: RSU_BASE_PORT + index
         for index, (rsu_name, _, _, _) in enumerate(cluster_specs)
     }
+    router = None
+    if routing == "aodv":
+        router = WirelessRouter(topology, RoutingSimulator(seed=seed))
+        for name, port in {**peer_directory, **rsu_directory}.items():
+            router.register(name, port)
+        print("[ROUTING] Ideal-link Python AODV enabled; host TCP is delivery plumbing.")
+    else:
+        print("[ROUTING] Direct baseline: routing overhead and NRL are not modeled.")
     server = Server(SERVER_PORT, expected_rsus=len(cluster_specs),
                     dataset_type=dataset, total_rounds=total_rounds,
                     security_authority=authority, security_identity=server_identity,
@@ -141,7 +177,7 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
                     batch_verification_enabled=batch_verify,
                     rsu_directory=rsu_directory,
                     vanet_scaler=vanet_scaler,
-                    random_seed=seed)
+                    random_seed=seed, aodv_enabled=router is not None)
 
     # 3. RSUs
     rsus = []
@@ -155,6 +191,7 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
                   security_identity=rsu_identities.get(rsu_name),
                   security_enabled=security,
                   batch_verification_enabled=batch_verify,
+                  router=router, total_rounds=total_rounds,
                   initial_global_weights={
                       key: value.detach().cpu().clone()
                       for key, value in server.model.state_dict().items()
@@ -190,6 +227,7 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
                 if vanet_partitions is not None else None
             ),
             random_seed=seed + dev_id,
+            router=router,
         )
         devices.append(device)
 
@@ -213,6 +251,11 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
 
     # 6. Await completion
     training_done_event.wait()
+    if router is not None:
+        # Silent-round watchdogs can close the server before a disconnected
+        # vehicle finishes. Keep receivers alive and wait before exporting.
+        for device in devices:
+            device.training_thread.join()
     time.sleep(1.0)
 
     # Clean shutdown of sockets
@@ -256,7 +299,12 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
     print(f"[OK] Metrics saved to '{csv_filename}' and 'metrics.csv'")
 
     # 7. Generate Plots
+    if router is not None:
+        router.simulator.ledger.export(dataset, router.simulator.metadata())
     logger.generate_plots(prefix=dataset)
+    if router is not None:
+        from routing_plots import plot_routing_metrics
+        plot_routing_metrics(f"{dataset}_routing_rounds.csv", prefix=dataset)
 
     print("\n" + "=" * 65)
     print(f" Training Complete for [{dataset.upper()}]!")
@@ -282,6 +330,12 @@ def main():
                         help="Total communication rounds")
     parser.add_argument('--seed', type=int, default=SIMULATION_SEED,
                         help="Simulation random seed")
+    parser.add_argument('--routing', choices=['direct', 'aodv'], default='direct',
+                        help="Wireless routing model; AODV uses an ideal-link event simulation")
+    parser.add_argument('--clusters', type=int, default=None,
+                        help="Explicit experiment RSU count (1..20); default keeps configured layout")
+    parser.add_argument('--vehicles', type=int, default=None,
+                        help="Fixed vehicles per RSU (1..99); default keeps configured random range")
     parser.add_argument('--heterogeneous', action="store_true", default=True,
                         help="Enable heterogeneous private architectures across devices")
     parser.add_argument('--homogeneous', dest='heterogeneous', action='store_false',
@@ -304,12 +358,15 @@ def main():
             security=args.security,
             batch_verify=args.batch,
             seed=args.seed,
+            routing=args.routing,
+            clusters=args.clusters, vehicles=args.vehicles,
         )
     elif args.dataset == "both":
         print("\n>>> Running [1/2]: MNIST Simulation...")
         cmd_mnist = [
             sys.executable, "main.py",
             "--dataset", "mnist",
+            "--routing", args.routing,
             "--rounds", str(args.rounds),
             "--seed", str(args.seed),
         ]
@@ -319,12 +376,16 @@ def main():
             cmd_mnist.append("--no-security")
         if not args.batch:
             cmd_mnist.append("--no-batch")
+        for option in ("clusters", "vehicles"):
+            if getattr(args, option) is not None:
+                cmd_mnist.extend(["--" + option, str(getattr(args, option))])
         subprocess.run(cmd_mnist, check=True)
 
         print("\n>>> Running [2/2]: VANET Simulation...")
         cmd_vanet = [
             sys.executable, "main.py",
             "--dataset", "vanet",
+            "--routing", args.routing,
             "--rounds", str(args.rounds),
             "--seed", str(args.seed),
         ]
@@ -334,6 +395,9 @@ def main():
             cmd_vanet.append("--no-security")
         if not args.batch:
             cmd_vanet.append("--no-batch")
+        for option in ("clusters", "vehicles"):
+            if getattr(args, option) is not None:
+                cmd_vanet.extend(["--" + option, str(getattr(args, option))])
         subprocess.run(cmd_vanet, check=True)
 
         print("\n[DONE] Both MNIST and VANET simulations finished successfully!")

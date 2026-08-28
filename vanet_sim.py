@@ -170,6 +170,25 @@ class VanetTopology:
     # ------------------------------------------------------------------
     # Mobility — called once per round
     # ------------------------------------------------------------------
+    def routing_snapshot(self):
+        """Freeze eligible V2V/V2RSU edges; backhaul is never a radio edge."""
+        from routing_sim import TopologySnapshot
+        with self._lock:
+            vehicles = dict(self._vehicle_pos)
+            rsus = dict(self._rsu_pos)
+        edges = []
+        for first, first_position in sorted(vehicles.items()):
+            for second, second_position in sorted(vehicles.items()):
+                if first < second:
+                    distance = self._dist(first_position, second_position)
+                    if distance <= V2V_RANGE:
+                        edges.append((first, second, distance))
+            for rsu, position in sorted(rsus.items()):
+                distance = self._dist(first_position, position)
+                if distance <= V2RSU_RANGE:
+                    edges.append((first, rsu, distance))
+        return TopologySnapshot.from_edges([*vehicles, *rsus], edges)
+
     def move_vehicle(self, name, dt=10.0):
         """Advance *name* by speed × dt, with random steering jitter.
 

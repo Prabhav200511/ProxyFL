@@ -46,3 +46,9 @@ Thumbs.db
 .idea/
 # Generated plot output directory
 plots/
+# Generated routing experiments and per-run network traces
+routing_results/
+experiment_results/
+*_routing_rounds.csv
+*_routing_events.jsonl
+*_routing_metadata.json

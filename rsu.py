@@ -43,12 +43,14 @@ class RSU:
                  topology=None, vehicle_names=None,
                  security_authority=None, security_identity=None,
                  security_enabled=None, batch_verification_enabled=None,
-                 initial_global_weights=None):
+                 initial_global_weights=None, router=None, total_rounds=1):
         self.name = name
         self.port = port
         self.cluster_ports = cluster_ports
         self.server_port = server_port
         self.topology = topology
+        self.router = router
+        self.total_rounds = total_rounds
         self.vehicle_names = vehicle_names or []
         self.global_reference_weights = (
             {
@@ -81,6 +83,7 @@ class RSU:
         self._round_timers = {}
         self._round_deadlines = {}  # round -> hard cap (perf_counter) for collection
         self._lock = threading.Lock()  # protects round_buffers, completed_rounds, _round_timers
+        self._shutdown = False
         self.receiver = Receiver(self.port, self.on_receive, node_name=self.name)
 
     def _decode_server_global(self, msg):
@@ -246,6 +249,10 @@ class RSU:
                         ("127.0.0.1", port), vehicle_msg,
                         sender_name=self.name, round_num=round_num,
                         wireless_link=wireless_link,
+                        router=getattr(self, "router", None),
+                        unsecured_msg={"type": "GLOBAL_UPDATE", "sender": self.name,
+                                       "recipient": vehicle_name, "round": round_num,
+                                       "global_weights": serialize_weights(weights)},
                     )
                 except Exception as exc:
                     print(f"[{self.name}] [ERROR] Could not deliver round "
@@ -283,6 +290,7 @@ class RSU:
                 print(f"[{self.name}] [ERROR] NO_CLUSTER_UPDATE fallback "
                       f"failed for round {r}: {fallback_exc!r}")
         finally:
+            self._arm_silent_round(r + 1)
             metrics_tracker.record_duration(
                 self.name, r, "rsu_round_execution",
                 time.perf_counter() - rsu_t0,
@@ -480,6 +488,26 @@ class RSU:
 
     def start(self):
         self.receiver.start()
+        self._arm_silent_round(1)
+
+    def _arm_silent_round(self, r):
+        """AODV-only wall-clock safeguard even when no vehicle can report."""
+        if getattr(self, "router", None) is None or r > self.total_rounds:
+            return
+        with self._lock:
+            if getattr(self, "_shutdown", False) or r in self.completed_rounds or r in self._round_timers:
+                return
+            self.round_buffers.setdefault(r, [])
+            self.round_reported.setdefault(r, set())
+            self._round_deadlines[r] = time.perf_counter() + RSU_ROUND_MAX_WAIT
+            timer = threading.Timer(RSU_ROUND_MAX_WAIT, self._force_aggregate, args=[r])
+            timer.daemon = True
+            self._round_timers[r] = timer
+            timer.start()
 
     def shutdown(self):
+        with self._lock:
+            self._shutdown = True
+            for r in list(self._round_timers):
+                self._cancel_timer_locked(r)
         self.receiver.shutdown()

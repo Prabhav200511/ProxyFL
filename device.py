@@ -83,13 +83,14 @@ class Device:
                  dataset_type="mnist", private_model_class=None,
                  total_rounds=TOTAL_ROUNDS, security_authority=None,
                  security_identity=None, security_enabled=None,
-                 vanet_partition=None, random_seed=SIMULATION_SEED):
+                 vanet_partition=None, random_seed=SIMULATION_SEED, router=None):
         self.name = name
         self.port = port
         self.rsu_port = rsu_port
         self.rsu_name = rsu_name
         self.device_id = int(device_id)
         self.topology = topology
+        self.router = router
         self.peer_directory = peer_directory or {}
         self.dataset_type = dataset_type
         self.total_rounds = total_rounds
@@ -516,8 +517,12 @@ class Device:
             peer_port = self.peer_directory.get(peer)
             if peer_port is None:
                 continue
+            raw_payload = serialize_weights(local_weights)
+            unsecured_msg = {
+                "type": "PEER_UPDATE", "sender": self.name, "recipient": peer,
+                "round": round_num, "weights": raw_payload,
+            }
             if self.security_enabled and self.signer is not None and self.security_authority is not None:
-                raw_payload = serialize_weights(local_weights)
                 sig = self.signer.sign(raw_payload)
                 aad = message_aad("PEER_UPDATE", self.name, peer, round_num)
                 peer_info = self.security_authority.public_info(peer)
@@ -537,6 +542,7 @@ class Device:
                 }
             send_msg(("127.0.0.1", peer_port), msg,
                      sender_name=self.name, round_num=round_num,
+                     router=getattr(self, "router", None), unsecured_msg=unsecured_msg,
                      wireless_link=WirelessLink(
                          "v2v", self.topology.get_v2v_distance(
                              self.name, peer)))
@@ -598,7 +604,10 @@ class Device:
             self._build_no_update_message(round_num),
             sender_name=self.name,
             round_num=round_num,
-            wireless_link=WirelessLink(
+            router=getattr(self, "router", None),
+            unsecured_msg={"type": "NO_UPDATE", "sender": self.name,
+                           "recipient": self.rsu_name, "round": round_num},
+            wireless_link=None if getattr(self, "router", None) else WirelessLink(
                 "v2rsu", self.topology.get_distance_to_rsu(
                     self.name, self.rsu_name)),
         )
@@ -703,9 +712,11 @@ class Device:
                 self.name, self.rsu_name)
             can_reach = self.topology.can_reach_rsu(
                 self.name, self.rsu_name)
+            if getattr(self, "router", None) is not None:
+                can_reach = True  # Attempt AODV to the SAME assigned RSU.
 
             if can_reach and not self.budget_exhausted:
-                print(f"[{self.name}] In range of RSU ({dist:.0f}m). "
+                print(f"[{self.name}] RSU distance ({dist:.0f}m). "
                       f"Sending proxy to {self.rsu_name}...")
                 with self.proxy_lock:
                     proxy_weights = {k: v.cpu() for k, v in self.proxy_model.state_dict().items()}
@@ -713,8 +724,10 @@ class Device:
                 # Eq. 6 — V2V neighbor gossip before hierarchical upload
                 proxy_weights = self._v2v_share_and_aggregate(r, proxy_weights)
 
+                raw_payload = serialize_weights(proxy_weights)
+                unsecured_msg = {"type": "LOCAL_UPDATE", "sender": self.name,
+                                 "round": r, "weights": raw_payload}
                 if self.security_enabled and self.signer is not None and self.security_authority is not None:
-                    raw_payload = serialize_weights(proxy_weights)
                     with Timer(self.name, r, "signature_generation"):
                         sig = self.signer.sign(raw_payload)
                     with Timer(self.name, r, "encryption"):
@@ -737,7 +750,8 @@ class Device:
                 sent = send_msg(
                     ("127.0.0.1", self.rsu_port), msg,
                     sender_name=self.name, round_num=r,
-                    wireless_link=WirelessLink("v2rsu", dist),
+                    router=getattr(self, "router", None), unsecured_msg=unsecured_msg,
+                    wireless_link=None if getattr(self, "router", None) else WirelessLink("v2rsu", dist),
                 )
                 if sent:
                     self._request_sent_at[r] = send_started
@@ -811,7 +825,8 @@ class Device:
     # ------------------------------------------------------------------
     def start(self):
         self.receiver.start()
-        threading.Thread(target=self.send, daemon=True).start()
+        self.training_thread = threading.Thread(target=self.send, daemon=True)
+        self.training_thread.start()
 
     def shutdown(self):
         self.receiver.shutdown()

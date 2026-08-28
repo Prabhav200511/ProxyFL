@@ -1,6 +1,7 @@
 # Native Python AODV routing and communication metrics
 
-Status: proposed design for user review; implementation has not started.
+Status: approved and implemented; verification recorded in
+`docs/python-aodv-verification.md`.
 
 ## Goal and branch
 
@@ -253,5 +254,5 @@ traffic explicitly; also verify integration using actual serialized messages.
 10. Direct mode and the existing 55-test baseline remain valid. New graphs have
     tested data series, readable labels, correct units, and no fabricated NRL.
 
-Implementation begins after review of this specification. No implementation
-or AODV measurement is claimed by this design document itself.
+This specification defines the implementation acceptance criteria; measured
+results are reported separately from the design.

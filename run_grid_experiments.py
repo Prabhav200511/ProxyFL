@@ -24,6 +24,8 @@ import sys
 import time
 import argparse
 import subprocess
+import shutil
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import matplotlib
@@ -213,8 +215,10 @@ def plot_grid_results(summary_df, detailed_df, dataset_name="vanet", out_dir="ex
         print(f"[!] Warning plotting convergence curves for {dataset_name}: {e}")
 
 
-def run_dataset_grid(dataset, clusters, vehicles, rounds, out_dir, resume):
+def run_dataset_grid(dataset, clusters, vehicles, rounds, out_dir, resume, routing="direct"):
     """Run full grid search for a single dataset."""
+    # Never resume an AODV run from direct/legacy results.
+    out_dir = os.path.join(out_dir, routing)
     os.makedirs(out_dir, exist_ok=True)
     summary_csv_path = os.path.join(out_dir, f"{dataset}_results_summary.csv")
     detailed_csv_path = os.path.join(out_dir, f"{dataset}_results_detailed_rounds.csv")
@@ -228,7 +232,8 @@ def run_dataset_grid(dataset, clusters, vehicles, rounds, out_dir, resume):
         try:
             existing_df = pd.read_csv(summary_csv_path)
             for _, row in existing_df.iterrows():
-                completed_configs.add((int(row['clusters']), int(row['vehicles_per_cluster'])))
+                if row.get('status') == 'SUCCESS':
+                    completed_configs.add((int(row['clusters']), int(row['vehicles_per_cluster'])))
             summary_rows = existing_df.to_dict('records')
             if os.path.exists(detailed_csv_path):
                 detailed_rows = pd.read_csv(detailed_csv_path).to_dict('records')
@@ -266,11 +271,24 @@ def run_dataset_grid(dataset, clusters, vehicles, rounds, out_dir, resume):
                 "--dataset", dataset,
                 "--clusters", str(c),
                 "--vehicles", str(v),
+                "--routing", routing,
                 "--rounds", str(rounds)
             ]
 
             try:
                 subprocess.run(cmd, check=True)
+                run_dir = Path(out_dir) / f"{dataset}_c{c}_v{v}"
+                run_dir.mkdir(parents=True, exist_ok=True)
+                for suffix in ("training_logs.txt", "metrics.csv", "simulation_summary.csv"):
+                    artifact = Path(f"{dataset}_{suffix}")
+                    if artifact.exists():
+                        shutil.copy2(artifact, run_dir / artifact.name)
+                if routing == "aodv":
+                    for suffix in ("rounds.csv", "events.jsonl", "metadata.json"):
+                        artifact = Path(f"{dataset}_routing_{suffix}")
+                        shutil.copy2(artifact, run_dir / artifact.name)
+                for artifact in Path("plots").glob(f"{dataset}_*.png"):
+                    shutil.copy2(artifact, run_dir / artifact.name)
                 duration = round(time.time() - start_time, 2)
 
                 # Parse resulting logs
@@ -365,6 +383,8 @@ def main():
                         help="Datasets for simulations (default: vanet mnist)")
     parser.add_argument('--rounds', type=int, default=5,
                         help="Number of communication rounds per simulation (default: 5)")
+    parser.add_argument('--routing', choices=['direct', 'aodv'], default='direct',
+                        help="Keep direct and AODV experiment results in separate directories")
     parser.add_argument('--clusters', nargs='+', type=int, default=DEFAULT_CLUSTERS,
                         help="List of cluster counts (default: 2 4 6 8 10)")
     parser.add_argument('--vehicles', nargs='+', type=int, default=DEFAULT_VEHICLES,
@@ -397,7 +417,8 @@ def main():
             vehicles=args.vehicles,
             rounds=args.rounds,
             out_dir=args.out_dir,
-            resume=args.resume
+            resume=args.resume,
+            routing=args.routing,
         )
 
     print("\n" + "=" * 70)

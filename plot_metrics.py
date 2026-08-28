@@ -388,7 +388,7 @@ def _write_vanet_plot_explanations(df, vehicle_group, coverage_total=None):
     print(f"[PLOT] Generated: '{output_path}'")
 
 
-def plot_all(log_file="training_logs.txt", csv_file=None, prefix=""):
+def plot_all(log_file="training_logs.txt", csv_file=None, prefix="", routing_csv=None):
     prefix_str = f"{prefix}_" if prefix else ""
     g_acc_dict, v_priv_acc, v_train_loss = parse_logs(log_file)
     dataset_title = f" ({prefix.upper()})" if prefix else ""
@@ -471,6 +471,10 @@ def plot_all(log_file="training_logs.txt", csv_file=None, prefix=""):
     )
     if os.path.exists(target_csv):
         plot_metrics_from_csv(target_csv, prefix=prefix)
+    # Explicit opt-in prevents stale AODV files from labeling a direct run.
+    if routing_csv is not None:
+        from routing_plots import plot_routing_metrics
+        plot_routing_metrics(routing_csv, prefix=prefix)
 
 
 def plot_metrics_from_csv(csv_path, prefix=""):
