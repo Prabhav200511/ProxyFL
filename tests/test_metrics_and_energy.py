@@ -71,6 +71,19 @@ class MetricsAndEnergyTests(unittest.TestCase):
         }
         self.assertTrue(required.issubset(frame.columns))
 
+    def test_export_preserves_global_f1_and_recall(self) -> None:
+        self.tracker.record_value("Server", 1, "global_proxy_f1", 0.75)
+        self.tracker.record_value("Server", 1, "global_proxy_recall", 0.625)
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "metrics.csv")
+            self.tracker.export_csv(path)
+            frame = pd.read_csv(path)
+
+        self.assertIn("global_proxy_f1", frame.columns)
+        self.assertIn("global_proxy_recall", frame.columns)
+        self.assertEqual(frame.loc[0, "global_proxy_f1"], 0.75)
+        self.assertEqual(frame.loc[0, "global_proxy_recall"], 0.625)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

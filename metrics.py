@@ -173,7 +173,8 @@ class MetricsTracker:
         data = self.rows(quality_metrics)
         columns = [
             "node", "round", "train_loss", "train_accuracy_pct", "private_test_accuracy_pct",
-            "epsilon", "delta", "global_proxy_accuracy_pct", "successful_updates",
+            "epsilon", "delta", "global_proxy_accuracy_pct", "global_proxy_f1",
+            "global_proxy_recall", "successful_updates",
             "throughput_updates_per_sec", "throughput_bytes_per_sec",
             "vanet_wireless_bits", "vanet_airtime_s",
             "vanet_link_capacity_bps", "vanet_goodput_bps",

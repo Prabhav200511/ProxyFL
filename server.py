@@ -273,7 +273,7 @@ class Server:
     # Evaluation
     # ------------------------------------------------------------------
     def evaluate_global_model(self, weights):
-        if not self.test_loader:
+        if not getattr(self, "test_loader", None):
             return 0.0, 0.0, 0.0
 
         self.model.load_state_dict(weights)
@@ -351,14 +351,21 @@ class Server:
     def _aggregate_round(self, r, data, rsu_directory_snapshot, round_start_t):
         """Verify, FedAvg, evaluate and broadcast one round's cluster models."""
         if not data:
-            self._print_in_range_vehicle_counts(r)
+            coverage = self._print_in_range_vehicle_counts(r)
+            if (coverage
+                    and coverage.get("total", {}).get("in_range") == 0):
+                print(f"[SERVER] Round {r}: all RSUs have 0 directly "
+                      "in-range assigned vehicles; training continues with "
+                      "the unchanged global proxy.")
             print(f"[SERVER] Round {r}: no RSU supplied a model update; "
                   "broadcasting the current global proxy.")
             weights = {
                 k: v.cpu() for k, v in self.model.state_dict().items()}
+            self._report_global_metrics(
+                r, weights, successful_updates=0, total_bytes=0.0,
+                round_start_t=round_start_t,
+            )
             self._broadcast_global(r, weights, rsu_directory_snapshot)
-            metrics_tracker.record_value(
-                "Server", r, "successful_updates", 0.0)
             return
 
         self._print_in_range_vehicle_counts(r)
@@ -432,21 +439,15 @@ class Server:
             print(f"[SERVER] [!] 0 valid cluster weights for Round {r}.")
             weights = {
                 k: v.cpu() for k, v in self.model.state_dict().items()}
+            self._report_global_metrics(
+                r, weights, successful_updates=0, total_bytes=0.0,
+                round_start_t=round_start_t,
+            )
             self._broadcast_global(r, weights, rsu_directory_snapshot)
-            metrics_tracker.record_value(
-                "Server", r, "successful_updates", 0.0)
             return
 
         # Equation (8): central server forms the arithmetic mean of RSU models.
         global_weights = average_weights(cluster_weights)
-
-        # Evaluate
-        acc, f1, recall = self.evaluate_global_model(global_weights)
-        logger.log_global(r, acc)
-
-        round_wall_clock = time.perf_counter() - round_start_t
-        # Legacy updates/sec (kept for CSV compatibility)
-        throughput_ups = len(cluster_weights) / max(round_wall_clock, 0.001)
 
         # Strict throughput: total bytes delivered to the server this round / wall-clock
         total_bytes = 0.0
@@ -476,24 +477,53 @@ class Server:
                     total_bytes += len(serialize_weights(w))
                 except Exception:
                     pass
-        throughput_bps = total_bytes / max(round_wall_clock, 0.001)
-
-        metrics_tracker.record_value("Server", r, "global_proxy_accuracy_pct", acc * 100.0)
-        metrics_tracker.record_value("Server", r, "successful_updates", float(len(cluster_weights)))
-        metrics_tracker.record_value("Server", r, "throughput_updates_per_sec", throughput_ups)
-        metrics_tracker.record_value("Server", r, "throughput_bytes_per_sec", throughput_bps)
-        metrics_tracker.record_value(
-            "Server", r, "model_payload_bytes_rx", total_bytes)
-
-        print(f"\n[SERVER] --- ROUND {r} GLOBAL PROXY METRICS ---")
-        print(f"         Test Accuracy : {round(acc * 100, 2)}%")
-        print(f"         F1-Score      : {round(f1, 4)}")
-        print(f"         Recall        : {round(recall, 4)}")
-        print(f"         Legacy server collection: {round(throughput_bps, 2)} B/s "
-              f"({round(throughput_ups, 2)} updates/sec, wall-clock {round(round_wall_clock, 2)}s)\n")
+        self._report_global_metrics(
+            r, global_weights,
+            successful_updates=len(cluster_weights),
+            total_bytes=total_bytes,
+            round_start_t=round_start_t,
+        )
 
         # Broadcast global proxy to all RSUs
         self._broadcast_global(r, global_weights, rsu_directory_snapshot)
+
+    def _report_global_metrics(
+            self, r, weights, successful_updates, total_bytes,
+            round_start_t):
+        """Evaluate, print, and persist a complete server row for one round."""
+        acc, f1, recall = self.evaluate_global_model(weights)
+        logger.log_global(r, acc)
+
+        round_wall_clock = time.perf_counter() - round_start_t
+        throughput_ups = (
+            float(successful_updates) / max(round_wall_clock, 0.001))
+        throughput_bps = float(total_bytes) / max(round_wall_clock, 0.001)
+
+        metrics_tracker.record_value(
+            "Server", r, "global_proxy_accuracy_pct", acc * 100.0)
+        metrics_tracker.record_value("Server", r, "global_proxy_f1", f1)
+        metrics_tracker.record_value(
+            "Server", r, "global_proxy_recall", recall)
+        metrics_tracker.record_value(
+            "Server", r, "successful_updates", float(successful_updates))
+        metrics_tracker.record_value(
+            "Server", r, "throughput_updates_per_sec", throughput_ups)
+        metrics_tracker.record_value(
+            "Server", r, "throughput_bytes_per_sec", throughput_bps)
+        metrics_tracker.record_value(
+            "Server", r, "model_payload_bytes_rx", float(total_bytes))
+
+        print(f"\n[SERVER] --- ROUND {r} GLOBAL PROXY METRICS ---")
+        print(f"         Test Accuracy : {round(acc * 100, 2)}%")
+        print(f"         F1-Score               : {round(f1, 4)}")
+        print(f"         Recall                 : {round(recall, 4)}")
+        print(f"         Successful Updates     : {successful_updates}")
+        print(f"         Model Payload Received : {round(total_bytes, 2)} bytes")
+        print(f"         Server Collection Rate : {round(throughput_bps, 2)} B/s")
+        print(f"         Update Processing Rate : {round(throughput_ups, 2)} "
+              "updates/sec")
+        print(f"         Round Wall-Clock       : "
+              f"{round(round_wall_clock, 2)}s\n")
 
     def _force_aggregate(self, r):
         force_t0 = time.perf_counter()
@@ -511,7 +541,7 @@ class Server:
                 self._cancel_timer_locked(r)
                 self.round_buffers.pop(r, None)
                 self.round_reported.pop(r, None)
-                self.round_start_times.pop(r, None)
+                round_start_t = self.round_start_times.pop(r, force_t0)
                 rsu_directory_snapshot = dict(self.rsu_directory)
 
         if has_data:
@@ -519,12 +549,8 @@ class Server:
             return
 
         try:
-            self._print_in_range_vehicle_counts(r)
-            weights = {
-                k: v.cpu() for k, v in self.model.state_dict().items()}
-            self._broadcast_global(r, weights, rsu_directory_snapshot)
-            metrics_tracker.record_value(
-                "Server", r, "successful_updates", 0.0)
+            self._aggregate_round(
+                r, [], rsu_directory_snapshot, round_start_t)
         except Exception as exc:
             print(f"[SERVER] [ERROR] Empty-round broadcast failed for round "
                   f"{r}: {exc!r}")
