@@ -12,6 +12,7 @@ import pandas as pd
 
 import plot_metrics
 from logger import TrainingLogger
+from routing_sim import RoutingSimulator, TopologySnapshot
 
 
 class PlotReportingTests(unittest.TestCase):
@@ -98,6 +99,80 @@ PRIVATE MODEL TEST ACCURACY
                     os.path.join("plots", "vanet_loss_vs_rounds.png")))
                 self.assertFalse(os.path.exists("vanet_accuracy_vs_rounds.png"))
                 self.assertFalse(os.path.exists("vanet_loss_vs_rounds.png"))
+            finally:
+                os.chdir(original_directory)
+
+    def test_training_logger_includes_aodv_plots_and_explanations(self) -> None:
+        training_logger = TrainingLogger()
+        training_logger.log_vehicle(1, "C0_V1", 0.8, 0.7)
+        training_logger.log_private_accuracy(1, "C0_V1", 0.72)
+        training_logger.log_global(1, 0.68)
+        metric_rows = [
+            {
+                "node": "C0_V1", "round": 1, "training_ms": 1.0,
+                "train_loss": 0.8, "private_test_accuracy_pct": 72.0,
+                "vanet_wireless_bits": 8_000.0,
+                "vanet_airtime_s": 0.01,
+            },
+            {
+                "node": "Server", "round": 1,
+                "global_proxy_accuracy_pct": 68.0,
+                "vehicles_in_range_total": 1.0,
+                "vehicles_assigned_total": 1.0,
+            },
+        ]
+        simulator = RoutingSimulator(capacity=lambda distance: 1_000_000.0)
+        simulator.submit(
+            "C0_V1", "RSU_0", 1250, 1200, 1,
+            TopologySnapshot.from_edges(
+                ["C0_V1", "relay", "RSU_0"],
+                [("C0_V1", "relay", 100), ("relay", "RSU_0", 100)],
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_directory = os.getcwd()
+            os.chdir(temp_dir)
+            try:
+                training_logger.save_logs("vanet_training_logs.txt")
+                pd.DataFrame(metric_rows).to_csv(
+                    "vanet_metrics.csv", index=False)
+                simulator.ledger.export(
+                    "vanet", simulator.metadata(
+                        traffic="Federated Learning model envelopes"))
+                with patch.object(plot_metrics, "PLOT_OUTPUT_DIR", "plots"):
+                    training_logger.generate_plots(prefix="vanet")
+                    from routing_plots import plot_routing_metrics
+                    plot_routing_metrics(
+                        "vanet_routing_rounds.csv", prefix="vanet")
+
+                expected_aodv_files = [
+                    "vanet_aodv_routing_overhead_vs_rounds.png",
+                    "vanet_communication_volume_vs_rounds.png",
+                    "vanet_normalized_routing_load_vs_rounds.png",
+                    "vanet_aodv_network_latency_vs_rounds.png",
+                ]
+                for filename in expected_aodv_files:
+                    self.assertTrue(os.path.exists(
+                        os.path.join("plots", filename)), filename)
+
+                report_path = os.path.join(
+                    "plots", "vanet_plot_explanations.md")
+                with open(report_path, encoding="utf-8") as report_file:
+                    report = report_file.read()
+                for filename in [
+                        "vanet_accuracy_vs_rounds.png",
+                        *expected_aodv_files,
+                ]:
+                    heading = f"## `{filename}`"
+                    image = f"![{filename}]({filename})"
+                    self.assertIn(heading, report)
+                    section = report.split(heading, 1)[1].split("## `", 1)[0]
+                    self.assertIn(image, section)
+                    self.assertLess(
+                        section.index(image),
+                        section.index("Why the line rises and falls"),
+                    )
             finally:
                 os.chdir(original_directory)
 
@@ -189,6 +264,14 @@ PRIVATE MODEL TEST ACCURACY
             self.assertIn("vanet_vehicles_in_range_vs_rounds.png", explanations)
             self.assertIn("vanet_throughput_vs_rounds.png", explanations)
             self.assertIn("Why the line rises and falls", explanations)
+            image = "![vanet_vehicles_in_range_vs_rounds.png]"
+            self.assertIn(image, explanations)
+            coverage_section = explanations.split(
+                "## `vanet_vehicles_in_range_vs_rounds.png`", 1)[1]
+            self.assertLess(
+                coverage_section.index(image),
+                coverage_section.index("Why the line rises and falls"),
+            )
 
 
 if __name__ == "__main__":

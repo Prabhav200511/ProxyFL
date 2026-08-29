@@ -8,6 +8,93 @@ import pandas as pd
 import plot_metrics as shared
 
 
+_AODV_REPORT_MARKER = "<!-- AODV_PLOT_EXPLANATIONS -->"
+
+
+def _extrema_summary(frame, values, unit=""):
+    numeric = pd.to_numeric(values, errors="coerce").dropna()
+    if numeric.empty:
+        return "No values were recorded for this run."
+    minimum_index = numeric.idxmin()
+    maximum_index = numeric.idxmax()
+    suffix = f" {unit}" if unit else ""
+    return (
+        f"Minimum: {numeric.loc[minimum_index]:.3f}{suffix} in round "
+        f"{int(frame.loc[minimum_index, 'round'])}; maximum: "
+        f"{numeric.loc[maximum_index]:.3f}{suffix} in round "
+        f"{int(frame.loc[maximum_index, 'round'])}."
+    )
+
+
+def _append_vanet_routing_explanations(csv_path, output_dir):
+    """Append measured AODV graphs and explanations to the VANET report."""
+    frame = pd.read_csv(csv_path).sort_values("round").reset_index(drop=True)
+    routing_total_kib = (
+        frame["rreq_bytes_tx"]
+        + frame["rrep_bytes_tx"]
+        + frame["rerr_bytes_tx"]
+    ) / 1024.0
+    wireless_total_kib = frame["total_wireless_bytes_tx"] / 1024.0
+
+    entries = [
+        (
+            "vanet_aodv_routing_overhead_vs_rounds.png",
+            _extrema_summary(frame, routing_total_kib, "KiB"),
+            "AODV routing overhead rises when Route Request floods, Route Reply "
+            "returns, retries, or Route Error notifications require more hop-by-hop "
+            "transmissions. It falls when active routes are reused and remain valid.",
+        ),
+        (
+            "vanet_communication_volume_vs_rounds.png",
+            _extrema_summary(frame, wireless_total_kib, "KiB"),
+            "Total wireless volume combines Federated Learning payloads, security "
+            "bytes, AODV control bodies, and Internet Protocol/User Datagram Protocol "
+            "headers. It changes with delivered updates, path length, and route "
+            "discovery or repair traffic.",
+        ),
+        (
+            "vanet_normalized_routing_load_vs_rounds.png",
+            _extrema_summary(frame, frame["normalized_routing_load"]),
+            "Normalized Routing Load increases when more AODV control-packet "
+            "transmissions are needed per delivered data packet. It is undefined "
+            "when no data packet reaches its destination and remains a separate "
+            "metric rather than part of byte overhead.",
+        ),
+        (
+            "vanet_aodv_network_latency_vs_rounds.png",
+            "Successful deliveries: "
+            + _extrema_summary(
+                frame, frame["successful_network_latency_mean_s"], "s")
+            + " All attempts: "
+            + _extrema_summary(frame, frame["network_latency_mean_s"], "s"),
+            "Modeled AODV latency rises with longer multi-hop paths, route discovery, "
+            "retries, and broken-link recovery. It falls when a short active route is "
+            "available and packets can be forwarded immediately.",
+        ),
+    ]
+
+    report_path = Path(output_dir) / "vanet_plot_explanations.md"
+    if report_path.exists():
+        base = report_path.read_text(encoding="utf-8")
+    else:
+        base = "# VANET plot explanations\n"
+    base = base.split(_AODV_REPORT_MARKER, 1)[0].rstrip()
+    lines = [base, "", _AODV_REPORT_MARKER, ""]
+    for filename, observation, reason in entries:
+        lines.extend([
+            f"## `{filename}`",
+            "",
+            f"![{filename}]({filename})",
+            "",
+            f"Observed range: {observation}",
+            "",
+            f"Why the line rises and falls: {reason}",
+            "",
+        ])
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def build_routing_figures(csv_path, prefix=""):
     csv_path = Path(csv_path)
     suffix = "_routing_rounds.csv"
@@ -93,6 +180,9 @@ def plot_routing_metrics(csv_path, prefix="", output_dir=None):
             filename = f"{prefix}_{name}.png" if prefix else f"{name}.png"
             shared._save_fig(filename, f"{prefix}_" if prefix else "", also_unprefixed=False)
             paths.append(str(Path(shared.PLOT_OUTPUT_DIR, filename).resolve()))
+        if figures and prefix.lower() == "vanet":
+            _append_vanet_routing_explanations(
+                csv_path, Path(shared.PLOT_OUTPUT_DIR))
     finally:
         shared.PLOT_OUTPUT_DIR = old_directory
         for figure in figures.values():

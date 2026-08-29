@@ -315,6 +315,11 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
     print(f"  - 'plots/{dataset}_cryptographic_operations.png' & 'plots/{dataset}_throughput_vs_rounds.png'")
     print(f"  - 'plots/{dataset}_vehicles_in_range_vs_rounds.png'")
     if dataset == "vanet":
+        if router is not None:
+            print("  - 'plots/vanet_aodv_routing_overhead_vs_rounds.png'")
+            print("  - 'plots/vanet_communication_volume_vs_rounds.png'")
+            print("  - 'plots/vanet_normalized_routing_load_vs_rounds.png'")
+            print("  - 'plots/vanet_aodv_network_latency_vs_rounds.png'")
         print("  - 'plots/vanet_plot_explanations.md'")
     print("=" * 65 + "\n")
 
@@ -330,8 +335,11 @@ def main():
                         help="Total communication rounds")
     parser.add_argument('--seed', type=int, default=SIMULATION_SEED,
                         help="Simulation random seed")
-    parser.add_argument('--routing', choices=['direct', 'aodv'], default='direct',
-                        help="Wireless routing model; AODV uses an ideal-link event simulation")
+    parser.add_argument(
+        '--routing', choices=['direct', 'aodv'], default=None,
+        help=("Wireless routing model; defaults to AODV for VANET and "
+              "direct for MNIST"),
+    )
     parser.add_argument('--clusters', type=int, default=None,
                         help="Explicit experiment RSU count (1..20); default keeps configured layout")
     parser.add_argument('--vehicles', type=int, default=None,
@@ -351,6 +359,8 @@ def main():
     args = parser.parse_args()
 
     if args.dataset in ["mnist", "vanet"]:
+        routing = args.routing or (
+            "aodv" if args.dataset == "vanet" else "direct")
         run_single_simulation(
             dataset=args.dataset,
             total_rounds=args.rounds,
@@ -358,15 +368,17 @@ def main():
             security=args.security,
             batch_verify=args.batch,
             seed=args.seed,
-            routing=args.routing,
+            routing=routing,
             clusters=args.clusters, vehicles=args.vehicles,
         )
     elif args.dataset == "both":
+        mnist_routing = args.routing or "direct"
+        vanet_routing = args.routing or "aodv"
         print("\n>>> Running [1/2]: MNIST Simulation...")
         cmd_mnist = [
             sys.executable, "main.py",
             "--dataset", "mnist",
-            "--routing", args.routing,
+            "--routing", mnist_routing,
             "--rounds", str(args.rounds),
             "--seed", str(args.seed),
         ]
@@ -385,7 +397,7 @@ def main():
         cmd_vanet = [
             sys.executable, "main.py",
             "--dataset", "vanet",
-            "--routing", args.routing,
+            "--routing", vanet_routing,
             "--rounds", str(args.rounds),
             "--seed", str(args.seed),
         ]
@@ -408,6 +420,10 @@ def main():
         print("  - plots/*_end_to_end_time_vs_rounds.png & plots/*_action_to_response_latency.png")
         print("  - plots/*_cryptographic_operations.png & plots/*_throughput_vs_rounds.png (Mbps)")
         print("  - plots/*_vehicles_in_range_vs_rounds.png")
+        print("  - plots/vanet_aodv_routing_overhead_vs_rounds.png")
+        print("  - plots/vanet_communication_volume_vs_rounds.png")
+        print("  - plots/vanet_normalized_routing_load_vs_rounds.png")
+        print("  - plots/vanet_aodv_network_latency_vs_rounds.png")
         print("  - plots/vanet_plot_explanations.md")
 
 

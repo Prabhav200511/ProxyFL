@@ -369,6 +369,8 @@ def _write_vanet_plot_explanations(df, vehicle_group, coverage_total=None):
         lines.extend([
             f"## `{filename}`",
             "",
+            f"![{filename}]({filename})",
+            "",
             f"Observed range: {observation}",
             "",
             f"Why the line rises and falls: {reason}",
