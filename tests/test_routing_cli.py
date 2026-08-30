@@ -1,13 +1,82 @@
 import io
+import threading
 import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import main
-from config import RSU_LAYOUT
+from config import RSU_LAYOUT, TOTAL_ROUNDS
+from round_coordinator import RoundCoordinator
 
 
 class RoutingCliTests(unittest.TestCase):
+    def test_main_wait_surfaces_worker_abort_without_waiting_for_server(self):
+        waiter = getattr(main, "wait_for_server_completion", None)
+        self.assertIsNotNone(waiter, "main must observe coordinator aborts")
+        coordinator = RoundCoordinator(["A"], ["R"])
+        coordinator.abort("A worker failed")
+
+        with self.assertRaisesRegex(RuntimeError, "A worker failed"):
+            waiter(threading.Event(), coordinator, poll_interval=0.001)
+
+    def test_worker_join_has_one_bounded_deadline(self):
+        joiner = getattr(main, "join_device_workers", None)
+        self.assertIsNotNone(joiner, "device joins must have a bounded deadline")
+        release = threading.Event()
+        worker = threading.Thread(
+            target=release.wait, kwargs={"timeout": 1}, daemon=True)
+        worker.start()
+        device = type("DeviceStub", (), {
+            "name": "A",
+            "training_thread": worker,
+        })()
+        coordinator = RoundCoordinator(["A"], ["R"])
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "A"):
+                joiner([device], coordinator, timeout=0.01)
+            with self.assertRaisesRegex(RuntimeError, "did not finish"):
+                coordinator.raise_if_aborted()
+        finally:
+            release.set()
+            worker.join(timeout=1)
+
+    def test_round_audit_rejects_missing_server_or_vehicle_rounds(self):
+        audit = getattr(main, "validate_round_outputs", None)
+        self.assertIsNotNone(audit, "a final configured-round audit is required")
+        training_logger = type("Log", (), {
+            "global_proxy_acc": {1: 70.0, 2: 71.0},
+            "vehicle_train_loss": {
+                "A": {1: 0.5, 2: 0.4},
+                "B": {1: 0.6},
+            },
+        })()
+
+        with self.assertRaisesRegex(RuntimeError, "B.*rounds.*2"):
+            audit(training_logger, 2, ["A", "B"])
+
+    def test_round_audit_accepts_exact_configured_sequence(self):
+        audit = getattr(main, "validate_round_outputs", None)
+        self.assertIsNotNone(audit, "a final configured-round audit is required")
+        training_logger = type("Log", (), {
+            "global_proxy_acc": {1: 70.0, 2: 71.0},
+            "vehicle_train_loss": {
+                "A": {1: 0.5, 2: 0.4},
+                "B": {1: 0.6, 2: 0.5},
+            },
+        })()
+
+        audit(training_logger, 2, ["A", "B"])
+
+    def test_default_run_uses_configured_total_rounds(self):
+        captured = []
+        with patch("sys.argv", ["main.py", "--dataset", "vanet"]), \
+                patch("main.run_single_simulation",
+                      side_effect=lambda **kwargs: captured.append(kwargs)):
+            main.main()
+
+        self.assertEqual(captured[0]["total_rounds"], TOTAL_ROUNDS)
+
     def test_standard_runs_use_dataset_appropriate_routing_defaults(self):
         captured = []
 

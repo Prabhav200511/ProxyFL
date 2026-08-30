@@ -53,12 +53,14 @@ class Server:
                  security_authority=None, security_identity=None, topology=None,
                  cluster_vehicle_names=None, security_enabled=None,
                  batch_verification_enabled=None, rsu_directory=None,
-                 vanet_scaler=None, random_seed=SIMULATION_SEED, aodv_enabled=False):
+                 vanet_scaler=None, random_seed=SIMULATION_SEED, aodv_enabled=False,
+                 round_coordinator=None):
         self.port = port
         self.expected_rsus = expected_rsus
         self.dataset_type = dataset_type
         self.total_rounds = total_rounds
         self.aodv_enabled = aodv_enabled
+        self.round_coordinator = round_coordinator
         self._shutdown = False
         self.security_authority = security_authority
         self.signer = security_identity
@@ -96,6 +98,9 @@ class Server:
         self._round_deadlines = {}  # round -> hard cap (perf_counter)
         self._lock = threading.Lock()  # protects round_buffers, completed_rounds, rsu_ports, _round_timers
         self.receiver = Receiver(self.port, self.on_receive, node_name="Server")
+        if self.round_coordinator is not None:
+            self.round_coordinator.add_round_open_callback(
+                self._arm_silent_round)
 
         torch.manual_seed(random_seed)
         if self.dataset_type == "mnist":
@@ -150,11 +155,21 @@ class Server:
     def _broadcast_global(self, round_num, weights, rsu_directory_snapshot):
         """Send one recipient-bound global message to every known RSU."""
         for rsu_name, port in rsu_directory_snapshot.items():
-            msg = self._build_global_message(rsu_name, round_num, weights)
-            send_msg(
-                ("127.0.0.1", port), msg,
-                sender_name="Server", round_num=round_num,
-            )
+            coordinator = getattr(self, "round_coordinator", None)
+            delivered = False
+            try:
+                msg = self._build_global_message(
+                    rsu_name, round_num, weights)
+                delivered = send_msg(
+                    ("127.0.0.1", port), msg,
+                    sender_name="Server", round_num=round_num,
+                )
+            except Exception as exc:
+                print(f"[SERVER] [ERROR] Could not deliver round {round_num} "
+                      f"global to {rsu_name}: {exc!r}")
+            if not delivered and coordinator is not None:
+                coordinator.record_rsu_result(
+                    round_num, rsu_name, set())
 
     def _print_in_range_vehicle_counts(self, r):
         """Record and print assigned-vehicle coverage for every RSU."""
@@ -345,7 +360,7 @@ class Server:
             )
             if r >= self.total_rounds:
                 training_done_event.set()
-            else:
+            elif getattr(self, "round_coordinator", None) is None:
                 self._arm_silent_round(r + 1)
 
     def _aggregate_round(self, r, data, rsu_directory_snapshot, round_start_t):
@@ -561,7 +576,7 @@ class Server:
             )
             if r >= self.total_rounds:
                 training_done_event.set()
-            else:
+            elif getattr(self, "round_coordinator", None) is None:
                 self._arm_silent_round(r + 1)
 
     def _cancel_timer_locked(self, r):
@@ -595,7 +610,8 @@ class Server:
     def start(self):
         print(f"[SERVER] Listening on port {self.port} | device={DEVICE}")
         self.receiver.start()
-        self._arm_silent_round(1)
+        if getattr(self, "round_coordinator", None) is None:
+            self._arm_silent_round(1)
 
     def _arm_silent_round(self, r):
         """Start the AODV no-traffic cap without fabricating an RSU report."""

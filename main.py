@@ -21,7 +21,7 @@ import torch
 from config import (
     SERVER_PORT, RSU_BASE_PORT, DEVICE_BASE_PORT, TOTAL_ROUNDS,
     SECURITY_ENABLED, BATCH_VERIFICATION_ENABLED, RSU_LAYOUT,
-    VEHICLES_PER_CLUSTER_RANGE, SIMULATION_SEED,
+    VEHICLES_PER_CLUSTER_RANGE, SIMULATION_SEED, TIMEOUT,
 )
 import config
 from server import Server, training_done_event
@@ -37,6 +37,7 @@ from metrics import metrics_tracker
 from data_utils import prepare_vanet_partitions
 from network import WirelessRouter
 from routing_sim import RoutingSimulator
+from round_coordinator import RoundCoordinator
 
 
 def cluster_layout(count):
@@ -57,6 +58,59 @@ def cluster_layout(count):
                     occupied.add(position)
         radius += 1
     return specs
+
+
+def validate_round_outputs(training_logger, total_rounds, vehicle_names):
+    """Reject incomplete or out-of-range round data before exporting plots."""
+    expected = set(range(1, total_rounds + 1))
+    problems = []
+
+    def compare(label, actual_rounds):
+        actual = set(actual_rounds)
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        if missing:
+            problems.append(
+                f"{label} missing rounds {', '.join(map(str, missing))}")
+        if extra:
+            problems.append(
+                f"{label} has unexpected rounds {', '.join(map(str, extra))}")
+
+    compare("Server", training_logger.global_proxy_acc)
+    for vehicle_name in vehicle_names:
+        compare(
+            vehicle_name,
+            training_logger.vehicle_train_loss.get(vehicle_name, {}),
+        )
+    if problems:
+        raise RuntimeError("Round audit failed: " + "; ".join(problems))
+
+
+def wait_for_server_completion(done_event, coordinator, poll_interval=0.1):
+    """Wait for the final server round while surfacing worker failures."""
+    while not done_event.wait(timeout=poll_interval):
+        coordinator.raise_if_aborted()
+    coordinator.raise_if_aborted()
+
+
+def join_device_workers(devices, coordinator, timeout=TIMEOUT):
+    """Join every worker within one shared deadline or abort the run."""
+    deadline = time.monotonic() + timeout
+    for device in devices:
+        remaining = max(deadline - time.monotonic(), 0.0)
+        device.training_thread.join(timeout=remaining)
+    alive = [
+        device.name for device in devices
+        if device.training_thread.is_alive()
+    ]
+    if alive:
+        message = (
+            "device workers did not finish before the shared deadline: "
+            + ", ".join(alive)
+        )
+        coordinator.abort(message)
+        raise RuntimeError(message)
+    coordinator.raise_if_aborted()
 
 
 def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True,
@@ -136,6 +190,10 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
             device_id_counter += 1
 
     peer_directory = {meta[0]: meta[1] for meta in vehicle_meta}
+    round_coordinator = RoundCoordinator(
+        [meta[0] for meta in vehicle_meta],
+        [rsu_name for rsu_name, _, _, _ in cluster_specs],
+    )
 
     # Register identities with Authority (MVD enrollment + AID issuance)
     rsu_identities = {}
@@ -177,7 +235,8 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
                     batch_verification_enabled=batch_verify,
                     rsu_directory=rsu_directory,
                     vanet_scaler=vanet_scaler,
-                    random_seed=seed, aodv_enabled=router is not None)
+                    random_seed=seed, aodv_enabled=router is not None,
+                    round_coordinator=round_coordinator)
 
     # 3. RSUs
     rsus = []
@@ -192,6 +251,7 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
                   security_enabled=security,
                   batch_verification_enabled=batch_verify,
                   router=router, total_rounds=total_rounds,
+                  round_coordinator=round_coordinator,
                   initial_global_weights={
                       key: value.detach().cpu().clone()
                       for key, value in server.model.state_dict().items()
@@ -228,6 +288,7 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
             ),
             random_seed=seed + dev_id,
             router=router,
+            round_coordinator=round_coordinator,
         )
         devices.append(device)
 
@@ -250,12 +311,19 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
     print(f"\n[MAIN] All {total_vehicles} vehicles active. Training underway...\n")
 
     # 6. Await completion
-    training_done_event.wait()
-    if router is not None:
-        # Silent-round watchdogs can close the server before a disconnected
-        # vehicle finishes. Keep receivers alive and wait before exporting.
-        for device in devices:
-            device.training_thread.join()
+    run_failure = None
+    try:
+        wait_for_server_completion(training_done_event, round_coordinator)
+    except RuntimeError as exc:
+        run_failure = exc
+    # The final server aggregation can complete just before vehicle receiver
+    # callbacks and the cohort barrier. Keep every receiver alive until every
+    # vehicle has left the final round, for direct and AODV runs alike.
+    try:
+        join_device_workers(devices, round_coordinator)
+    except RuntimeError as exc:
+        if run_failure is None:
+            run_failure = exc
     time.sleep(1.0)
 
     # Clean shutdown of sockets
@@ -266,6 +334,12 @@ def run_single_simulation(dataset, total_rounds=TOTAL_ROUNDS, heterogeneous=True
         device.shutdown()
 
     metrics_tracker.finish_simulation()
+    if run_failure is not None:
+        raise run_failure
+    validate_round_outputs(
+        logger, total_rounds, [meta[0] for meta in vehicle_meta])
+    print(f"[ROUND AUDIT] Completed and stored rounds 1-{total_rounds} "
+          f"for Server and all {total_vehicles} vehicles.")
 
     # Save log text files
     log_filename = f"{dataset}_training_logs.txt"
@@ -331,7 +405,7 @@ def main():
     parser.add_argument('--dataset', type=str, default="vanet",
                         choices=["mnist", "vanet", "both"],
                         help="Dataset to run: 'mnist', 'vanet', or 'both'")
-    parser.add_argument('--rounds', type=int, default=5,
+    parser.add_argument('--rounds', type=int, default=TOTAL_ROUNDS,
                         help="Total communication rounds")
     parser.add_argument('--seed', type=int, default=SIMULATION_SEED,
                         help="Simulation random seed")

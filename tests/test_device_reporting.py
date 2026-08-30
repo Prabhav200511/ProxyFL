@@ -9,9 +9,92 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from device import Device
+from round_coordinator import RoundCoordinator
 
 
 class DeviceReportingTests(unittest.TestCase):
+    def test_inner_round_failure_aborts_coordinator_and_is_not_swallowed(self):
+        coordinator = RoundCoordinator(["C0_V1"], ["RSU_0"])
+        device = Device.__new__(Device)
+        device.name = "C0_V1"
+        device.round_coordinator = coordinator
+
+        handler = getattr(device, "_abort_round", None)
+        self.assertIsNotNone(handler, "inner round failures must abort the run")
+        with self.assertRaisesRegex(RuntimeError, "Round 3 failed"):
+            handler(3, ValueError("broken update"))
+        with self.assertRaisesRegex(RuntimeError, "broken update"):
+            coordinator.raise_if_aborted()
+
+    def test_unresolved_network_round_timeout_aborts_instead_of_advancing(self):
+        coordinator = RoundCoordinator(["C0_V1"], ["RSU_0"])
+        device = Device.__new__(Device)
+        device.name = "C0_V1"
+        device.round_coordinator = coordinator
+        device.round_event = threading.Event()
+        device.current_round = 1
+        device._round_phase = "waiting_global"
+        device._pending_global_updates = {}
+        device._request_sent_at = {}
+        device.proxy_lock = threading.Lock()
+
+        with patch("device.TIMEOUT", 0.01), self.assertRaisesRegex(
+                RuntimeError, "Network round 1"):
+            device._wait_for_round_sync(1)
+        with self.assertRaisesRegex(RuntimeError, "Network round 1"):
+            coordinator.raise_if_aborted()
+
+    def test_unhandled_worker_failure_aborts_all_round_barriers(self):
+        coordinator = RoundCoordinator(["C0_V1"], ["RSU_0"])
+        device = Device.__new__(Device)
+        device.name = "C0_V1"
+        device.round_coordinator = coordinator
+        device.send = MagicMock(side_effect=RuntimeError("training crashed"))
+
+        target = getattr(device, "_training_target", None)
+        self.assertIsNotNone(target, "device worker failures must abort barriers")
+        target()
+
+        with self.assertRaisesRegex(RuntimeError, "training crashed"):
+            coordinator.raise_if_aborted()
+
+    def test_unreachable_vehicle_uses_round_result_without_global_wait_timeout(self):
+        coordinator = RoundCoordinator(["C0_V1"], ["RSU_0"])
+        coordinator.record_rsu_result(1, "RSU_0", set())
+        device = Device.__new__(Device)
+        device.name = "C0_V1"
+        device.round_coordinator = coordinator
+        device.round_event = threading.Event()
+        device._round_phase = "waiting_global"
+        device._pending_global_updates = {}
+        device._request_sent_at = {}
+        device.proxy_lock = threading.Lock()
+
+        waiter = getattr(device, "_wait_for_round_sync", None)
+        self.assertIsNotNone(waiter, "coordinated round waiting is required")
+        self.assertFalse(waiter(1))
+
+    def test_delivered_vehicle_applies_global_before_round_barrier(self):
+        coordinator = RoundCoordinator(["C0_V1"], ["RSU_0"])
+        coordinator.record_rsu_result(1, "RSU_0", {"C0_V1"})
+        device = Device.__new__(Device)
+        device.name = "C0_V1"
+        device.round_coordinator = coordinator
+        device.round_event = threading.Event()
+        device.current_round = 1
+        device._round_phase = "training"
+        device._pending_global_updates = {}
+        device._request_sent_at = {}
+        device.proxy_lock = threading.Lock()
+        device.proxy_model = MagicMock()
+
+        device._handle_verified_global(1, {"weight": torch.tensor([2.0])})
+
+        waiter = getattr(device, "_wait_for_round_sync", None)
+        self.assertIsNotNone(waiter, "coordinated round waiting is required")
+        self.assertTrue(waiter(1))
+        device.proxy_model.load_state_dict.assert_called_once()
+
     def test_early_peer_update_is_not_discarded_before_average(self):
         device = Device.__new__(Device)
         device.name = "C0_V2"

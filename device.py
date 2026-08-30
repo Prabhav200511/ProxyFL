@@ -83,7 +83,8 @@ class Device:
                  dataset_type="mnist", private_model_class=None,
                  total_rounds=TOTAL_ROUNDS, security_authority=None,
                  security_identity=None, security_enabled=None,
-                 vanet_partition=None, random_seed=SIMULATION_SEED, router=None):
+                 vanet_partition=None, random_seed=SIMULATION_SEED, router=None,
+                 round_coordinator=None):
         self.name = name
         self.port = port
         self.rsu_port = rsu_port
@@ -91,6 +92,7 @@ class Device:
         self.device_id = int(device_id)
         self.topology = topology
         self.router = router
+        self.round_coordinator = round_coordinator
         self.peer_directory = peer_directory or {}
         self.dataset_type = dataset_type
         self.total_rounds = total_rounds
@@ -280,23 +282,31 @@ class Device:
     def _handle_verified_global(self, round_num, weights):
         """Apply a verified global only after this round's local work is done."""
         if round_num < self.current_round:
-            return
+            return False
+        accepted = False
+        applied = False
         if round_num > self.current_round:
             # A lagging vehicle used to discard globals for rounds it had not
             # reached yet and then stall for the full failsafe timeout on
             # arrival.  Stash it so _apply_pending_global can consume it.
             with self.proxy_lock:
                 self._pending_global_updates[round_num] = weights
-            return
-        applied = False
-        with self.proxy_lock:
-            if self._round_phase == ROUND_WAITING_GLOBAL:
-                self.proxy_model.load_state_dict(weights)
-                applied = True
-            elif self._round_phase in {ROUND_TRAINING, ROUND_REPORTING}:
-                self._pending_global_updates[round_num] = weights
+            accepted = True
+        else:
+            with self.proxy_lock:
+                if self._round_phase == ROUND_WAITING_GLOBAL:
+                    self.proxy_model.load_state_dict(weights)
+                    applied = True
+                    accepted = True
+                elif self._round_phase in {ROUND_TRAINING, ROUND_REPORTING}:
+                    self._pending_global_updates[round_num] = weights
+                    accepted = True
         if applied:
             self.round_event.set()
+        coordinator = getattr(self, "round_coordinator", None)
+        if accepted and coordinator is not None:
+            coordinator.record_vehicle_receipt(self.name, round_num)
+        return accepted
 
     def _apply_pending_global(self, round_num):
         """Apply a queued verified global when the reporting barrier is reached."""
@@ -612,6 +622,64 @@ class Device:
                     self.name, self.rsu_name)),
         )
 
+    def _abort_round(self, round_num, exc):
+        """Abort every waiter when a vehicle cannot complete a real round."""
+        message = f"Round {round_num} failed for {self.name}: {exc!r}"
+        coordinator = getattr(self, "round_coordinator", None)
+        if coordinator is not None:
+            coordinator.abort(message)
+        raise RuntimeError(message) from exc
+
+    def _wait_for_round_sync(self, round_num):
+        """Wait for this round's real global-delivery outcome.
+
+        The coordinator carries no model data.  A successful network delivery
+        must still be received and verified by this device; a failed delivery
+        advances with the previous proxy model instead of waiting 360 seconds.
+        """
+        if self.round_coordinator is None:
+            received = (
+                self._apply_pending_global(round_num)
+                or self.round_event.wait(timeout=TIMEOUT)
+            )
+            if not received:
+                print(f"[{self.name}] [!] Timed out waiting for round "
+                      f"{round_num} synchronization")
+            return received
+
+        delivered = self.round_coordinator.wait_for_vehicle_result(
+            self.name, round_num, timeout=TIMEOUT)
+        if delivered is None:
+            if self._apply_pending_global(round_num) or self.round_event.is_set():
+                return True
+            with self.proxy_lock:
+                if self._round_phase == ROUND_WAITING_GLOBAL:
+                    self._round_phase = ROUND_IDLE
+            message = (
+                f"Network round {round_num} did not close before the "
+                f"synchronization timeout for {self.name}"
+            )
+            self.round_coordinator.abort(message)
+            raise RuntimeError(message)
+        if not delivered:
+            with self.proxy_lock:
+                if self._round_phase == ROUND_WAITING_GLOBAL:
+                    self._round_phase = ROUND_IDLE
+            self._request_sent_at.pop(round_num, None)
+            print(f"[{self.name}] Global proxy for Round {round_num} was "
+                  "not delivered by the network; retaining the previous proxy.")
+            return False
+
+        received = (
+            self._apply_pending_global(round_num)
+            or self.round_event.is_set()
+        )
+        if not received:
+            self._request_sent_at.pop(round_num, None)
+            print(f"[{self.name}] [!] Network reported delivery for Round "
+                  f"{round_num}, but no verified global was received")
+        return received
+
     def _warn_if_privacy_high(self, epsilon):
         """Report a weak privacy regime without changing the configured policy."""
         if epsilon > DP_EPSILON_WARNING_THRESHOLD:
@@ -626,6 +694,9 @@ class Device:
     # ------------------------------------------------------------------
     def send(self):
         for r in range(1, self.total_rounds + 1):
+          if self.round_coordinator is not None:
+            self.round_coordinator.wait_for_round_start(
+                self.name, r, timeout=TIMEOUT)
           round_t0 = time.perf_counter()
           try:
             self.current_round = r
@@ -759,13 +830,7 @@ class Device:
                 # Wait for global update for this round
                 with self.proxy_lock:
                     self._round_phase = ROUND_WAITING_GLOBAL
-                received = (
-                    self._apply_pending_global(r)
-                    or self.round_event.wait(timeout=TIMEOUT)
-                )
-                if not received:
-                    self._request_sent_at.pop(r, None)
-                    print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
+                self._wait_for_round_sync(r)
             elif self.budget_exhausted and can_reach:
                 print(f"[{self.name}] In range but privacy budget exhausted. "
                       "Reporting NO_UPDATE and waiting for global update...")
@@ -774,12 +839,7 @@ class Device:
                     self._request_sent_at[r] = send_started
                 with self.proxy_lock:
                     self._round_phase = ROUND_WAITING_GLOBAL
-                received = (
-                    self._apply_pending_global(r)
-                    or self.round_event.wait(timeout=TIMEOUT)
-                )
-                if not received:
-                    print(f"[{self.name}] [!] Timed out waiting for global update for Round {r}")
+                self._wait_for_round_sync(r)
             else:
                 print(f"[{self.name}] [X] OUT OF RANGE ({dist:.0f}m > {V2RSU_RANGE}m). Synchronizing on round barrier...")
                 # NO_UPDATE is synchronization metadata only; no proxy parameters
@@ -789,12 +849,7 @@ class Device:
                     self._request_sent_at[r] = send_started
                 with self.proxy_lock:
                     self._round_phase = ROUND_WAITING_GLOBAL
-                received = (
-                    self._apply_pending_global(r)
-                    or self.round_event.wait(timeout=TIMEOUT)
-                )
-                if not received:
-                    print(f"[{self.name}] [!] Timed out waiting for round {r} synchronization")
+                self._wait_for_round_sync(r)
 
             # 6. Move vehicle
             self.topology.move_vehicle(self.name)
@@ -806,6 +861,7 @@ class Device:
             print(f"[{self.name}] [ERROR] Round {r} failed: {e}")
             import traceback
             traceback.print_exc()
+            self._abort_round(r, e)
           finally:
             with self._peer_lock:
                 self._peer_buffers.pop(r, None)
@@ -817,15 +873,28 @@ class Device:
             metrics_tracker.record_duration(
                 self.name, r, "device_round_execution", time.perf_counter() - round_t0
             )
+            if self.round_coordinator is not None:
+                self.round_coordinator.finish_round(
+                    self.name, r, timeout=TIMEOUT)
 
         print(f"[{self.name}] Training Finished")
 
     # ------------------------------------------------------------------
     # Startup
     # ------------------------------------------------------------------
+    def _training_target(self):
+        try:
+            self.send()
+        except BaseException as exc:
+            coordinator = getattr(self, "round_coordinator", None)
+            if coordinator is not None:
+                coordinator.abort(f"{self.name} worker failed: {exc!r}")
+            print(f"[{self.name}] [ERROR] Training worker stopped: {exc!r}")
+
     def start(self):
         self.receiver.start()
-        self.training_thread = threading.Thread(target=self.send, daemon=True)
+        self.training_thread = threading.Thread(
+            target=self._training_target, daemon=True)
         self.training_thread.start()
 
     def shutdown(self):

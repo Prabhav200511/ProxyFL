@@ -14,9 +14,11 @@ Each test pins one failure mode that silently destroyed a whole FL round:
 """
 
 import io
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -25,6 +27,7 @@ import config
 from device import Device, ROUND_TRAINING, ROUND_WAITING_GLOBAL
 from rsu import RSU
 from server import Server, training_done_event
+from logger import TrainingLogger
 
 HOT_PATH_MODULES = (
     "main.py", "device.py", "rsu.py", "server.py", "vanet_sim.py",
@@ -48,6 +51,36 @@ class ConsoleEncodingTests(unittest.TestCase):
             "non-ASCII log output can raise UnicodeEncodeError inside a "
             "receiver thread and abort an aggregation: " + ", ".join(offenders),
         )
+
+
+class PersistedRoundOrderTests(unittest.TestCase):
+    def test_saved_tables_sort_rounds_even_when_threads_log_out_of_order(self):
+        training_logger = TrainingLogger()
+        training_logger.log_vehicle(97, "fast", 0.1, 0.9)
+        training_logger.log_vehicle(63, "slow", 0.2, 0.8)
+        training_logger.log_global(97, 0.9)
+        training_logger.log_global(63, 0.8)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir, "training.log")
+            training_logger.save_logs(output)
+            rendered = output.read_text(encoding="utf-8")
+
+        vehicle_section, remaining = rendered.split(
+            "GLOBAL PROXY MODEL EVALUATION", 1)
+        global_section = remaining.split(
+            "CLUSTER AGGREGATION DIVERGENCE", 1)[0]
+
+        def rendered_rounds(section):
+            rounds = []
+            for line in section.splitlines():
+                cells = [cell.strip() for cell in line.split("|")]
+                if len(cells) > 1 and cells[1].isdigit():
+                    rounds.append(int(cells[1]))
+            return rounds
+
+        self.assertEqual(rendered_rounds(vehicle_section), [63, 97])
+        self.assertEqual(rendered_rounds(global_section), [63, 97])
 
 
 class RsuAggregationLivenessTests(unittest.TestCase):

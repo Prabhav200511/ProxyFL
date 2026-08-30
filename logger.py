@@ -67,15 +67,15 @@ class TrainingLogger:
     def save_logs(self, filename="training_logs.txt"):
         with open(filename, "w", encoding="utf-8") as f:
             f.write("VEHICLE TRAINING UPDATES\n")
-            f.write(self.vehicle_table.get_string())
+            f.write(self.vehicle_table.get_string(sortby="Round"))
             f.write("\n\nGLOBAL PROXY MODEL EVALUATION\n")
-            f.write(self.global_table.get_string())
+            f.write(self.global_table.get_string(sortby="Round"))
             f.write("\n\nCLUSTER AGGREGATION DIVERGENCE\n")
-            f.write(self.jsd_table.get_string())
+            f.write(self.jsd_table.get_string(sortby="Round"))
             f.write("\n\nPRIVATE MODEL TEST ACCURACY\n")
-            f.write(self.private_accuracy_table.get_string())
+            f.write(self.private_accuracy_table.get_string(sortby="Round"))
             f.write("\n\nDIFFERENTIAL PRIVACY ACCOUNTING\n")
-            f.write(self.privacy_table.get_string())
+            f.write(self.privacy_table.get_string(sortby="Round"))
 
     def generate_plots(self, prefix=""):
         """Generate every plot through the shared non-overlapping layout."""

@@ -43,7 +43,8 @@ class RSU:
                  topology=None, vehicle_names=None,
                  security_authority=None, security_identity=None,
                  security_enabled=None, batch_verification_enabled=None,
-                 initial_global_weights=None, router=None, total_rounds=1):
+                 initial_global_weights=None, router=None, total_rounds=1,
+                 round_coordinator=None):
         self.name = name
         self.port = port
         self.cluster_ports = cluster_ports
@@ -51,6 +52,7 @@ class RSU:
         self.topology = topology
         self.router = router
         self.total_rounds = total_rounds
+        self.round_coordinator = round_coordinator
         self.vehicle_names = vehicle_names or []
         self.global_reference_weights = (
             {
@@ -85,6 +87,9 @@ class RSU:
         self._lock = threading.Lock()  # protects round_buffers, completed_rounds, _round_timers
         self._shutdown = False
         self.receiver = Receiver(self.port, self.on_receive, node_name=self.name)
+        if self.round_coordinator is not None:
+            self.round_coordinator.add_round_open_callback(
+                self._arm_silent_round)
 
     def _decode_server_global(self, msg):
         """Authenticate and decode a Server-to-RSU global update."""
@@ -221,17 +226,18 @@ class RSU:
                 self.aggregate(r)
 
         elif msg_type == "GLOBAL_UPDATE":
+            round_num = msg.get("round")
             weights = self._decode_server_global(msg)
             if weights is None:
                 print(f"[{self.name}] [SECURITY] Dropped invalid GLOBAL_UPDATE")
                 return
-            round_num = msg.get("round")
             self.global_reference_weights = {
                 key: value.detach().cpu().clone()
                 for key, value in weights.items()
             }
             # Re-authenticate the global proxy separately for each vehicle.
             # One vehicle's failure must not deprive the rest of the cluster.
+            delivered_vehicles = set()
             for index, port in enumerate(self.cluster_ports):
                 if index >= len(self.vehicle_names):
                     continue
@@ -245,7 +251,7 @@ class RSU:
                             wireless_link = WirelessLink("rsu2v", distance)
                     vehicle_msg = self._build_vehicle_global(
                         vehicle_name, round_num, weights)
-                    send_msg(
+                    delivered = send_msg(
                         ("127.0.0.1", port), vehicle_msg,
                         sender_name=self.name, round_num=round_num,
                         wireless_link=wireless_link,
@@ -254,9 +260,15 @@ class RSU:
                                        "recipient": vehicle_name, "round": round_num,
                                        "global_weights": serialize_weights(weights)},
                     )
+                    if delivered:
+                        delivered_vehicles.add(vehicle_name)
                 except Exception as exc:
                     print(f"[{self.name}] [ERROR] Could not deliver round "
                           f"{round_num} global to {vehicle_name}: {exc!r}")
+            coordinator = getattr(self, "round_coordinator", None)
+            if coordinator is not None:
+                coordinator.record_rsu_result(
+                    round_num, self.name, delivered_vehicles)
 
     def aggregate(self, r):
         """FedAvg the received proxy weights and forward to the server.
@@ -290,7 +302,8 @@ class RSU:
                 print(f"[{self.name}] [ERROR] NO_CLUSTER_UPDATE fallback "
                       f"failed for round {r}: {fallback_exc!r}")
         finally:
-            self._arm_silent_round(r + 1)
+            if getattr(self, "round_coordinator", None) is None:
+                self._arm_silent_round(r + 1)
             metrics_tracker.record_duration(
                 self.name, r, "rsu_round_execution",
                 time.perf_counter() - rsu_t0,
@@ -488,7 +501,8 @@ class RSU:
 
     def start(self):
         self.receiver.start()
-        self._arm_silent_round(1)
+        if getattr(self, "round_coordinator", None) is None:
+            self._arm_silent_round(1)
 
     def _arm_silent_round(self, r):
         """AODV-only wall-clock safeguard even when no vehicle can report."""
